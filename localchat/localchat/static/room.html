@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Local Chat Room</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/styles/github-dark.min.css">
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <div class="site-shell">
+    <aside class="edge-rail edge-rail-left" aria-hidden="true">
+      <div id="edge-ad-left" class="edge-ad-band edge-ad-band-vertical">
+        <div class="edge-ad-slot edge-ad-slot-vertical"></div>
+        <div class="edge-ad-slot edge-ad-slot-vertical"></div>
+        <div class="edge-ad-slot edge-ad-slot-vertical"></div>
+      </div>
+    </aside>
+
+    <div class="content-stage room-page">
+      <div class="page-chrome">
+        <div class="site-banner">
+          <div>
+            <div class="site-kicker">MULTIPLAYER MODE</div>
+            <h1>LocalChat Room</h1>
+          </div>
+          <div class="banner-badges">
+            <span class="badge">WEBSOCKET ROOM</span>
+            <span class="badge">PER-USER AI</span>
+            <span class="badge">SHARED HISTORY</span>
+          </div>
+        </div>
+        <div class="marquee-bar">
+          <marquee behavior="scroll" direction="left" scrollamount="5">
+            ROOM CHAT ONLINE :: CONNECT TO LOCAL OR REMOTE LOCALCHAT :: EACH PERSON BRINGS THEIR OWN AI SETTINGS :: THE ROOM TRANSCRIPT STAYS SHARED
+          </marquee>
+        </div>
+        <div class="button-row">
+          <a class="web-button" href="/">AI CHAT ZONE</a>
+          <span class="web-button">SOCKET ROOM</span>
+          <a class="web-button" href="/drafter">DRAFTER</a>
+          <span class="web-button">SHARED TRANSCRIPT</span>
+          <span class="web-button">PERSONAL AGENTS</span>
+          <span class="web-button">LIVE ROOM MODE</span>
+        </div>
+      </div>
+
+      <div class="app-shell">
+        <aside class="sidebar">
+          <div class="sidebar-top">
+            <div class="panel-title">Room Control Center</div>
+            <p class="sidebar-copy">Connection details and room notes live here. The agent deck stays on the right so every participant can keep their own AI profile.</p>
+            <div class="mini-stats">
+              <div class="stat-chip">Mode: Socket Room</div>
+              <div class="stat-chip">Memory: Shared</div>
+            </div>
+            <div class="pixel-box">
+              <div class="pixel-box-title">Room Profile</div>
+              <div class="pixel-box-body">
+                <p><strong>Handle:</strong> <span id="room-profile-handle">guest</span></p>
+                <p><strong>Room:</strong> <span id="room-profile-name">lobby</span></p>
+                <p><strong>Agent:</strong> <span id="room-profile-agent">Room AI</span></p>
+                <p><strong>Status:</strong> <span id="room-profile-status" class="blink">OFFLINE</span></p>
+              </div>
+            </div>
+          </div>
+
+          <div class="history-wrap room-sidebar-scroll">
+            <div class="section-label">Connection Deck</div>
+            <div class="pixel-box room-connection-box">
+              <div class="pixel-box-title">Join Room</div>
+              <div class="pixel-box-body room-grid">
+                <label class="field-stack">
+                  <span>Server URL / IP</span>
+                  <input id="server-url-input" class="select-input" type="text" placeholder="http://127.0.0.1:8000">
+                </label>
+                <label class="field-stack">
+                  <span>Room</span>
+                  <input id="room-name-input" class="select-input" type="text" value="lobby">
+                </label>
+                <label class="field-stack">
+                  <span>Name</span>
+                  <input id="display-name-input" class="select-input" type="text" value="guest">
+                </label>
+                <div class="room-connection-actions">
+                  <button id="connect-room-button" class="primary-button" type="button">Connect</button>
+                  <button id="disconnect-room-button" class="secondary-button" type="button" disabled>Disconnect</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="pixel-box">
+              <div class="pixel-box-title">Room Notes</div>
+              <div class="pixel-box-body">
+                <p><strong>Transcript:</strong> everyone in the room sees the same messages and AI completions.</p>
+                <p><strong>AI owner:</strong> <code>@ai</code> uses the sender's selected room agent, model, and prompt.</p>
+                <p><strong>Remote target:</strong> point this page at a LocalChat server exposing <code>/ws/rooms/&lt;room&gt;</code>.</p>
+                <p><strong>Private collab:</strong> keep the host's room page local-only and have collaborators run LocalChat from source with the host IP.</p>
+              </div>
+            </div>
+          </div>
+
+          <div class="sidebar-bottom">
+            <div class="section-label">Room Status</div>
+            <p class="sidebar-copy">The room is shared. Your AI configuration is not.</p>
+          </div>
+        </aside>
+
+        <main class="main-panel room-main-panel">
+          <div class="workspace room-workspace">
+            <section class="chat-column room-column">
+              <section id="room-empty-state" class="empty-state">
+                <div class="empty-card">
+                  <p class="eyebrow">Room Ready</p>
+                  <h3>Connect to a room and start talking.</h3>
+                  <p>The room transcript is shared. When you type <code>@ai</code>, the server will post a reply generated from your own room agent settings.</p>
+                  <div class="empty-links">
+                    <span>join room</span>
+                    <span>shared transcript</span>
+                    <span>personal ai</span>
+                  </div>
+                  <div class="hero-grid">
+                    <div class="hero-tile">WEBSOCKET CHAT</div>
+                    <div class="hero-tile">PERSONAL MODEL DECK</div>
+                    <div class="hero-tile">SHARED AI OUTPUT</div>
+                  </div>
+                </div>
+              </section>
+
+              <section id="room-messages" class="messages room-messages"></section>
+
+              <footer class="composer-shell">
+                <div class="composer">
+                  <textarea id="room-message-input" placeholder="Chat with the room. Use @ai to ask your room agent." rows="1"></textarea>
+                  <div class="composer-actions">
+                    <button id="send-room-button" class="primary-button" type="button" disabled>Send To Room</button>
+                  </div>
+                </div>
+              </footer>
+            </section>
+
+            <aside class="chat-sidepanel room-sidepanel">
+              <div class="pixel-box">
+                <div class="pixel-box-title">Model Deck</div>
+                <div class="pixel-box-body">
+                  <div class="section-label">Saved Agent</div>
+                  <select id="room-agent-select" class="select-input"></select>
+                  <div class="section-label">Agent Name</div>
+                  <input id="room-agent-name-input" class="select-input" type="text" placeholder="Room AI">
+                  <div class="agent-actions">
+                    <button id="save-room-agent-button" class="secondary-button" type="button">Save Agent</button>
+                    <button id="delete-room-agent-button" class="secondary-button" type="button">Delete Agent</button>
+                  </div>
+                  <div class="section-label">Model</div>
+                  <select id="room-model-select" class="select-input"></select>
+                  <div class="section-label">Temperature</div>
+                  <input id="room-temperature-input" class="select-input" type="number" min="0" max="2" step="0.1" value="0.7">
+                  <div class="section-label">Max Tokens</div>
+                  <input id="room-max-tokens-input" class="select-input" type="number" min="64" max="4096" step="64" value="512">
+                  <div class="section-label">System Prompt</div>
+                  <textarea id="room-system-prompt" class="system-prompt" placeholder="Optional behavior instructions for your room agent"></textarea>
+                </div>
+              </div>
+            </aside>
+          </div>
+        </main>
+      </div>
+
+    </div>
+
+    <aside class="edge-rail edge-rail-right" aria-hidden="true">
+      <div id="edge-ad-right" class="edge-ad-band edge-ad-band-vertical">
+        <div class="edge-ad-slot edge-ad-slot-vertical"></div>
+        <div class="edge-ad-slot edge-ad-slot-vertical"></div>
+        <div class="edge-ad-slot edge-ad-slot-vertical"></div>
+      </div>
+    </aside>
+  </div>
+
+  <div class="edge-strip edge-strip-bottom" aria-hidden="true">
+    <div id="edge-ad-bottom" class="edge-ad-band edge-ad-band-horizontal">
+      <div class="edge-ad-slot edge-ad-slot-horizontal">
+        <img src="/downloads/vintage_ads/casino/20010702060202_gui_blue80.gif" alt="" loading="lazy" decoding="async">
+      </div>
+      <div class="edge-ad-slot edge-ad-slot-horizontal">
+        <img src="/downloads/vintage_ads/casino/20030401143018_468x60tournamentv5_80.gif" alt="" loading="lazy" decoding="async">
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.2.4/purify.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/15.0.7/marked.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/languages/javascript.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/languages/python.min.js"></script>
+  <script src="/assets/room.js" type="module"></script>
+</body>
+</html>

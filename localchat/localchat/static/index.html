@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Local Chat 2000</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/styles/github-dark.min.css">
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <div class="site-shell">
+    <aside class="edge-rail edge-rail-left" aria-hidden="true">
+      <div id="edge-ad-left" class="edge-ad-band edge-ad-band-vertical">
+        <div class="edge-ad-slot edge-ad-slot-vertical"></div>
+        <div class="edge-ad-slot edge-ad-slot-vertical"></div>
+        <div class="edge-ad-slot edge-ad-slot-vertical"></div>
+      </div>
+    </aside>
+
+    <div class="content-stage">
+      <div class="page-chrome">
+        <div class="site-banner">
+          <div>
+            <div class="site-kicker">WELCOME TO THE WEB</div>
+            <h1>LocalChat 2000</h1>
+          </div>
+          <div class="banner-badges">
+            <span id="status-pill" class="badge status-badge">Idle</span>
+            <span class="badge">BEST VIEWED FULL SCREEN</span>
+            <span class="badge">HTML + JS</span>
+            <span class="badge">NO PLUG-INS</span>
+          </div>
+        </div>
+        <div class="marquee-bar">
+          <marquee behavior="scroll" direction="left" scrollamount="5">
+            LOCAL CHAT ONLINE :: OLLAMA + HUGGING FACE + GEMINI :: LIVE STREAMING TOKENS :: PERSONAL HOMEPAGE ENERGY
+          </marquee>
+        </div>
+        <div class="button-row">
+          <span class="web-button">AI CHAT ZONE</span>
+          <a class="web-button" href="/room">SOCKET ROOM</a>
+          <a class="web-button" href="/drafter">DRAFTER</a>
+          <span class="web-button">TOTALLY SECURE</span>
+          <span class="web-button">BEST ON DSL</span>
+        </div>
+      </div>
+
+      <div class="app-shell">
+        <aside class="sidebar">
+          <div class="sidebar-top">
+            <div class="panel-title">Control Center</div>
+            <button id="new-chat-button" class="primary-button">Start New Chat</button>
+            <p class="sidebar-copy">Classic web shell. Modern local AI stack. Pick a model and send a message.</p>
+            <div class="mini-stats">
+              <div class="stat-chip">Online Now: You</div>
+              <div class="stat-chip">Theme: Retro</div>
+            </div>
+            <div class="pixel-box">
+              <div class="pixel-box-title">Profile</div>
+              <div class="pixel-box-body">
+                <p><strong>Handle:</strong> local_operator</p>
+                <p><strong>Status:</strong> <span class="blink">ONLINE</span></p>
+                <p><strong>Mood:</strong> training models</p>
+              </div>
+            </div>
+          </div>
+          <div class="history-wrap">
+            <div class="section-label">Buddy List / Conversations</div>
+            <div id="history-list" class="history-list"></div>
+          </div>
+          <div class="sidebar-bottom">
+          </div>
+        </aside>
+
+        <main class="main-panel">
+          <header class="topbar">
+            <div class="topbar-controls">
+              <button id="focus-mode-button" class="secondary-button" type="button">Focus Mode</button>
+            </div>
+          </header>
+
+          <div class="workspace">
+            <section class="chat-column">
+              <section id="empty-state" class="empty-state">
+                <div class="empty-card">
+                  <p class="eyebrow">Streaming Ready</p>
+                  <h3>Pick a model and start a conversation.</h3>
+                  <p>This page talks to <code>POST /v1/chat/completions</code> and prints the reply as it streams in live.</p>
+                  <section class="start-presets">
+                    <div class="start-presets-header">
+                      <div>
+                        <div class="section-label">Chat Presets</div>
+                        <p>Save a starter prompt, then launch a new chat with the first message already filled in.</p>
+                      </div>
+                    </div>
+                    <div class="preset-maker">
+                      <label class="field-stack">
+                        <span>Preset Name</span>
+                        <input id="preset-name-input" type="text" placeholder="Bug triage">
+                      </label>
+                      <label class="field-stack">
+                        <span>First Message</span>
+                        <textarea id="preset-message-input" rows="4" placeholder="Review this code for bugs and missing tests."></textarea>
+                      </label>
+                      <div class="preset-maker-actions">
+                        <button id="save-preset-button" class="secondary-button" type="button">Save Preset</button>
+                      </div>
+                    </div>
+                    <div id="preset-list" class="preset-list"></div>
+                  </section>
+                  <div class="empty-links">
+                    <span>guestbook</span>
+                    <span>chat room</span>
+                    <span>cool links</span>
+                  </div>
+                  <div class="hero-grid">
+                    <div class="hero-tile">LOCAL MODEL POWER</div>
+                    <div class="hero-tile">STREAMING TOKENS</div>
+                    <div class="hero-tile">OPENAI STYLE API</div>
+                  </div>
+                </div>
+              </section>
+
+              <section id="messages" class="messages"></section>
+
+              <footer class="composer-shell">
+                <div class="composer">
+                  <textarea id="message-input" placeholder="Message the model. Shift+Enter for a newline." rows="1"></textarea>
+                  <div class="composer-actions">
+                    <button id="stop-button" class="secondary-button" disabled>Stop</button>
+                    <button id="send-button" class="primary-button">Send Message</button>
+                  </div>
+                </div>
+              </footer>
+            </section>
+
+            <aside class="chat-sidepanel">
+              <div class="pixel-box">
+                <div class="pixel-box-title">Model Deck</div>
+                <div class="pixel-box-body">
+                  <div class="section-label">Saved Agent</div>
+                  <select id="agent-select" class="select-input"></select>
+                  <div class="section-label">Agent Name</div>
+                  <input id="agent-name-input" class="select-input" type="text" placeholder="Retro Coder">
+                  <div class="agent-actions">
+                    <button id="save-agent-button" class="secondary-button" type="button">Save Agent</button>
+                    <button id="delete-agent-button" class="secondary-button" type="button">Delete Agent</button>
+                  </div>
+                  <div class="section-label">Model</div>
+                  <select id="model-select" class="select-input"></select>
+                  <div class="deck-config-grid">
+                    <label class="field-stack compact">
+                      <span>Temperature</span>
+                      <input id="temperature-input" type="number" min="0" max="2" step="0.1" value="0.7">
+                    </label>
+                    <label class="field-stack compact">
+                      <span>Max Tokens</span>
+                      <input id="max-tokens-input" type="number" min="64" max="8192" step="64" value="1024">
+                    </label>
+                  </div>
+                  <div class="section-label">System Prompt</div>
+                  <textarea id="system-prompt" class="system-prompt" placeholder="Optional behavior instructions"></textarea>
+                </div>
+              </div>
+            </aside>
+          </div>
+        </main>
+      </div>
+
+    </div>
+
+    <aside class="edge-rail edge-rail-right" aria-hidden="true">
+      <div id="edge-ad-right" class="edge-ad-band edge-ad-band-vertical">
+        <div class="edge-ad-slot edge-ad-slot-vertical"></div>
+        <div class="edge-ad-slot edge-ad-slot-vertical"></div>
+        <div class="edge-ad-slot edge-ad-slot-vertical"></div>
+      </div>
+    </aside>
+  </div>
+
+  <div class="edge-strip edge-strip-bottom" aria-hidden="true">
+    <div id="edge-ad-bottom" class="edge-ad-band edge-ad-band-horizontal">
+      <div class="edge-ad-slot edge-ad-slot-horizontal">
+        <img src="/downloads/vintage_ads/casino/20010702060202_gui_blue80.gif" alt="" loading="lazy" decoding="async">
+      </div>
+      <div class="edge-ad-slot edge-ad-slot-horizontal">
+        <img src="/downloads/vintage_ads/casino/20030401143018_468x60tournamentv5_80.gif" alt="" loading="lazy" decoding="async">
+      </div>
+    </div>
+  </div>
+
+  <template id="message-template">
+    <article class="message">
+      <button class="icon-button delete-message-button corner-delete-button" type="button" aria-label="Delete message">x</button>
+      <div class="message-meta">
+        <span class="message-role"></span>
+        <div class="message-actions">
+          <button class="icon-button edit-message-button" type="button">Edit</button>
+          <button class="icon-button copy-message-button" type="button">Copy</button>
+        </div>
+      </div>
+      <div class="message-content markdown-body"></div>
+    </article>
+  </template>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.2.4/purify.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/15.0.7/marked.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/languages/javascript.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/languages/python.min.js"></script>
+  <script src="/assets/app.js" type="module"></script>
+</body>
+</html>

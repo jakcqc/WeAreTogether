@@ -1,0 +1,7 @@
+Access to PeterBrendan/AdImageNet is gated on Hugging Face.
+Log in with a Hugging Face token that has been approved for this dataset,
+then rerun scripts/download_hf_ad_datasets.py.
+Last error: 401 Client Error. (Request ID: Root=1-69b389c1-33af0d5d31f3af202e7a8651;284a2852-de8c-4174-9bbb-c681625a1528)
+
+Cannot access gated repo for url https://huggingface.co/datasets/PeterBrendan/AdImageNet/resolve/8b4c9ee3abc33fcdd6ba79f0b694926374aa090a/.gitattributes.
+Access to dataset PeterBrendan/AdImageNet is restricted. You must have access to it and be authenticated to access it. Please log in.

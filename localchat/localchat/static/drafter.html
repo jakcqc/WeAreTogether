@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Drafter</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/styles/github-dark.min.css">
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body class="drafter-page">
+  <div class="drafter-page-shell">
+    <div class="drafter-topnav">
+      <div class="button-row">
+        <a class="web-button" href="/">AI CHAT ZONE</a>
+        <a class="web-button" href="/room">SOCKET ROOM</a>
+        <span class="web-button">DRAFTER</span>
+      </div>
+    </div>
+
+    <div class="drafter-layout">
+      <aside class="sidebar drafter-sidebar drafter-left-rail">
+        <div class="pixel-box drafter-nav-shell">
+          <div class="pixel-box-title">Workspace</div>
+          <div class="pixel-box-body drafter-nav-body">
+            <div class="drafter-rail-meta">
+              <span id="drafter-status-pill" class="badge status-badge is-idle">Ready</span>
+              <span class="stat-chip">Room: <span id="draft-room-label">paper-main</span></span>
+              <span class="stat-chip">Cursor: <span id="cursor-position">1:1</span></span>
+            </div>
+
+            <div id="drafter-left-nav" class="drafter-panel-nav" role="tablist" aria-label="Drafter workspace panels">
+              <button id="drafter-overview-tab" class="secondary-button drafter-nav-button active" type="button" data-panel-key="overview" data-rail="left" draggable="true" role="tab" aria-selected="true" aria-controls="drafter-overview-panel">Overview</button>
+              <button id="drafter-ai-tab" class="secondary-button drafter-nav-button" type="button" data-panel-key="ai" data-rail="left" draggable="true" role="tab" aria-selected="false" aria-controls="drafter-ai-panel">AI Desk</button>
+              <button id="drafter-proposal-tab" class="secondary-button drafter-nav-button" type="button" data-panel-key="proposal" data-rail="left" draggable="true" role="tab" aria-selected="false" aria-controls="drafter-proposal-panel">Proposal</button>
+              <button id="drafter-assets-tab" class="secondary-button drafter-nav-button" type="button" data-panel-key="assets" data-rail="left" draggable="true" role="tab" aria-selected="false" aria-controls="drafter-assets-panel">Assets</button>
+              <button id="drafter-compile-tab" class="secondary-button drafter-nav-button" type="button" data-panel-key="compile" data-rail="left" draggable="true" role="tab" aria-selected="false" aria-controls="drafter-compile-panel">Compile</button>
+            </div>
+
+            <div id="drafter-left-stack" class="drafter-panel-stack">
+              <section id="drafter-overview-panel" class="pixel-box drafter-nav-panel active" data-panel-key="overview" data-rail="left" role="tabpanel" aria-labelledby="drafter-overview-tab">
+                <div class="pixel-box-title">Paper Profile</div>
+                <div class="pixel-box-body drafter-nav-panel-body">
+                  <div class="drafter-overview-stats">
+                    <p><strong>Doc:</strong> <span id="draft-name">main.tex</span></p>
+                    <p><strong>Compile:</strong> <span id="compile-status-label" class="blink">CLEAN</span></p>
+                    <p><strong>Words:</strong> <span id="word-count">0</span></p>
+                    <p><strong>Last AI diff:</strong> <span id="last-diff-status">none</span></p>
+                    <p><strong>Collaborators:</strong> <span id="collaborator-count">0</span></p>
+                  </div>
+                  <div class="drafter-export-actions">
+                    <button id="save-draft-button" class="secondary-button" type="button">Save Snapshot</button>
+                    <button id="download-draft-button" class="secondary-button" type="button">Download .tex</button>
+                    <button id="export-pdf-button" class="primary-button" type="button">Export PDF</button>
+                  </div>
+                </div>
+              </section>
+
+              <section id="drafter-ai-panel" class="pixel-box drafter-nav-panel" data-panel-key="ai" data-rail="left" role="tabpanel" aria-labelledby="drafter-ai-tab" hidden>
+                <div class="pixel-box-title">AI Desk</div>
+                <div class="pixel-box-body drafter-ai-box-body">
+                  <div class="agent-config-shell">
+                    <div class="agent-config-header">
+                      <span class="section-label">Agent Setup</span>
+                      <button id="drafter-agent-panel-toggle" class="secondary-button agent-panel-toggle" type="button" aria-expanded="true" aria-controls="drafter-agent-panel">Collapse Setup</button>
+                    </div>
+                    <div id="drafter-agent-panel" class="agent-config-panel">
+                      <div class="section-label">Saved Agent</div>
+                      <select id="drafter-agent-select" class="select-input"></select>
+                      <div class="section-label">Agent Name</div>
+                      <input id="drafter-agent-name-input" class="select-input" type="text" placeholder="Paper Editor">
+                      <div class="agent-actions">
+                        <button id="save-drafter-agent-button" class="secondary-button" type="button">Save Agent</button>
+                        <button id="delete-drafter-agent-button" class="secondary-button" type="button">Delete Agent</button>
+                      </div>
+
+                      <div class="section-label">Model</div>
+                      <select id="drafter-model-select" class="select-input"></select>
+                      <div class="deck-config-grid">
+                        <label class="field-stack compact">
+                          <span>Temperature</span>
+                          <input id="drafter-temperature-input" type="number" min="0" max="2" step="0.1" value="0.3">
+                        </label>
+                        <label class="field-stack compact">
+                          <span>Max Tokens</span>
+                          <input id="drafter-max-tokens-input" type="number" min="128" max="8192" step="64" value="1400">
+                        </label>
+                      </div>
+
+                      <div class="section-label">Instructions</div>
+                      <textarea id="drafter-system-prompt" class="system-prompt" placeholder="Optional standing instructions for the paper assistant"></textarea>
+                    </div>
+                  </div>
+
+                  <div class="drafter-chat-stack">
+                    <div class="section-label">Mode</div>
+                    <div class="mode-toggle-row">
+                      <button id="ask-mode-button" class="secondary-button mode-toggle active" type="button">Ask</button>
+                      <button id="agent-mode-button" class="secondary-button mode-toggle" type="button">Agent</button>
+                    </div>
+
+                    <div class="section-label">Request</div>
+                    <textarea id="drafter-request-input" class="system-prompt drafter-request" placeholder="Ask about the current paper, or tell the agent to revise it."></textarea>
+
+                    <div class="drafter-response-stack">
+                      <div class="section-label">Response</div>
+                      <div id="drafter-response" class="drafter-response">Responses appear here. Ask mode is for questions about the current paper. Agent mode is for proposed edits with an explanation and diff.</div>
+                    </div>
+
+                    <div class="agent-submit-row">
+                      <button id="run-drafter-ai-button" class="primary-button" type="button">Run AI</button>
+                    </div>
+                  </div>
+                </div>
+              </section>
+
+              <section id="drafter-proposal-panel" class="pixel-box drafter-nav-panel" data-panel-key="proposal" data-rail="left" role="tabpanel" aria-labelledby="drafter-proposal-tab" hidden>
+                <div class="pixel-box-title">Agent Proposal</div>
+                <div class="pixel-box-body diff-panel-body">
+                  <div class="diff-output-meta">
+                    <span class="section-label">Explanation</span>
+                    <span id="proposal-meta" class="room-meta-tail">No proposal yet</span>
+                  </div>
+                  <div id="agent-explanation" class="agent-explanation">Ask the drafting agent to revise the paper and it will return a rationale plus a diff against the current draft.</div>
+                  <div class="diff-output-meta">
+                    <span class="section-label">Unified Diff</span>
+                    <button id="apply-diff-button" class="primary-button" type="button" disabled>Apply AI Diff</button>
+                  </div>
+                  <pre id="agent-diff" class="agent-diff"><code>No diff yet.</code></pre>
+                </div>
+              </section>
+
+              <section id="drafter-assets-panel" class="pixel-box drafter-nav-panel" data-panel-key="assets" data-rail="left" role="tabpanel" aria-labelledby="drafter-assets-tab" hidden>
+                <div class="pixel-box-title">Asset Shelf</div>
+                <div class="pixel-box-body asset-panel-body">
+                  <div class="asset-toolbar">
+                    <div class="asset-toolbar-copy">Upload images, `.bib`, and `.tex` files, then insert a figure, citation, bibliography, or `\input{}` reference from here.</div>
+                    <div class="asset-toolbar-actions">
+                      <input id="drafter-asset-upload-input" class="asset-upload-input" type="file" accept="image/*,.bib,.tex" multiple>
+                      <button id="drafter-asset-upload-button" class="secondary-button" type="button">Upload Files</button>
+                      <button id="drafter-asset-refresh-button" class="secondary-button" type="button">Refresh</button>
+                    </div>
+                  </div>
+                  <div class="asset-layout">
+                    <div id="drafter-asset-list" class="asset-list"></div>
+                    <div id="drafter-asset-detail" class="asset-detail">
+                      <div class="asset-empty-state">No assets loaded yet.</div>
+                    </div>
+                  </div>
+                </div>
+              </section>
+
+              <section id="drafter-compile-panel" class="pixel-box drafter-nav-panel" data-panel-key="compile" data-rail="left" role="tabpanel" aria-labelledby="drafter-compile-tab" hidden>
+                <div class="pixel-box-title">Compile Log</div>
+                <div class="pixel-box-body drafter-nav-panel-body">
+                  <div id="compile-log" class="compile-log"></div>
+                </div>
+              </section>
+            </div>
+          </div>
+        </div>
+      </aside>
+
+      <div id="drafter-left-resizer" class="drafter-rail-resizer" role="separator" aria-label="Resize left panel" aria-orientation="vertical" tabindex="0"></div>
+
+      <main class="main-panel drafter-main-panel">
+        <div class="drafter-workspace">
+          <div id="drafter-editor-grid" class="drafter-editor-grid">
+            <section id="drafter-latex-pane" class="pixel-box drafter-pane" data-pane="latex">
+              <div class="pixel-box-title drafter-pane-title">
+                <span>LaTeX :: main.tex</span>
+                <div class="drafter-pane-actions">
+                  <button id="drafter-latex-toggle" class="secondary-button drafter-pane-button" type="button">Expand</button>
+                </div>
+              </div>
+              <div class="pixel-box-body drafter-pane-body">
+                <div id="latex-editor" class="latex-editor"></div>
+              </div>
+            </section>
+
+            <section id="drafter-preview-pane-shell" class="pixel-box drafter-pane" data-pane="preview">
+              <div class="pixel-box-title drafter-pane-title">
+                <span>PDF / Render View</span>
+                <div class="drafter-pane-actions">
+                  <button id="drafter-preview-toggle" class="secondary-button drafter-pane-button" type="button">Expand</button>
+                </div>
+              </div>
+              <div class="pixel-box-body drafter-pane-body">
+                <div id="preview-pane" class="paper-preview"></div>
+              </div>
+            </section>
+          </div>
+        </div>
+      </main>
+
+      <div id="drafter-right-resizer" class="drafter-rail-resizer" role="separator" aria-label="Resize right panel" aria-orientation="vertical" tabindex="0"></div>
+
+      <aside class="chat-sidepanel drafter-sidepanel drafter-right-rail">
+        <div class="pixel-box drafter-nav-shell">
+          <div class="pixel-box-title">Collaboration</div>
+          <div class="pixel-box-body drafter-nav-body">
+            <div id="drafter-right-nav" class="drafter-panel-nav" role="tablist" aria-label="Drafter collaboration panels">
+              <button id="drafter-connection-tab" class="secondary-button drafter-nav-button active" type="button" data-panel-key="connection" data-rail="right" draggable="true" role="tab" aria-selected="true" aria-controls="drafter-connection-panel">Connection</button>
+              <button id="drafter-collaborators-tab" class="secondary-button drafter-nav-button" type="button" data-panel-key="collaborators" data-rail="right" draggable="true" role="tab" aria-selected="false" aria-controls="drafter-collaborators-panel">Collaborators</button>
+            </div>
+
+            <div id="drafter-right-stack" class="drafter-panel-stack">
+              <section id="drafter-connection-panel" class="pixel-box drafter-nav-panel active" data-panel-key="connection" data-rail="right" role="tabpanel" aria-labelledby="drafter-connection-tab">
+                <div class="pixel-box-title">Shared Draft</div>
+                <div class="pixel-box-body room-grid">
+                  <label class="field-stack">
+                    <span>Server URL / IP</span>
+                    <input id="drafter-server-url-input" class="select-input" type="text" placeholder="http://127.0.0.1:8000">
+                  </label>
+                  <label class="field-stack">
+                    <span>Your Name</span>
+                    <input id="drafter-display-name-input" class="select-input" type="text" value="guest">
+                  </label>
+                  <label class="field-stack">
+                    <span>Draft Room</span>
+                    <input id="drafter-room-name-input" class="select-input" type="text" value="paper-main">
+                  </label>
+                  <div class="room-connection-actions">
+                    <button id="connect-drafter-button" class="primary-button" type="button">Connect</button>
+                    <button id="disconnect-drafter-button" class="secondary-button" type="button" disabled>Disconnect</button>
+                  </div>
+                  <div class="drafter-connection-line">
+                    <span class="section-label">Connection</span>
+                    <span id="drafter-connection-label" class="room-meta-tail">Disconnected</span>
+                  </div>
+                  <p class="sidebar-copy">Keep the host page local-only when possible. Remote collaborators can run LocalChat from source and connect to your server IP over the drafter socket.</p>
+                </div>
+              </section>
+
+              <section id="drafter-collaborators-panel" class="pixel-box drafter-nav-panel" data-panel-key="collaborators" data-rail="right" role="tabpanel" aria-labelledby="drafter-collaborators-tab" hidden>
+                <div class="pixel-box-title">Collaborators</div>
+                <div class="pixel-box-body drafter-nav-panel-body">
+                  <div id="collaborator-list" class="collaborator-list"></div>
+                </div>
+              </section>
+            </div>
+          </div>
+        </div>
+      </aside>
+    </div>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.2.4/purify.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/15.0.7/marked.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.6/ace.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.6/ext-language_tools.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.6/mode-latex.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.6/theme-textmate.min.js"></script>
+  <script src="/assets/drafter.js" type="module"></script>
+</body>
+</html>

@@ -1,0 +1,27 @@
+[project]
+name = "localchat"
+version = "0.1.0"
+description = "Local chat UI with OpenAI-style streaming endpoints for Ollama, Hugging Face, and Gemini."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115.12",
+  "google-genai>=1.30.0",
+  "openai>=1.76.0",
+  "python-dotenv>=1.1.0",
+  "uvicorn[standard]>=0.34.0",
+]
+
+[project.scripts]
+localchat = "localchat.main:run"
+localchat-models = "localchat.setup_models:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["localchat"]
+
+[tool.setuptools.package-data]
+localchat = ["static/*"]
