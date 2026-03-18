@@ -735,8 +735,76 @@ select {
   gap: 10px;
 }
 
+.room-voice-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.voice-participant-list {
+  display: grid;
+  gap: 8px;
+}
+
+.voice-participant-empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.voice-participant-row {
+  padding: 8px;
+  border: 2px solid var(--line-dark);
+  border-top-color: var(--line-light);
+  border-left-color: var(--line-light);
+  background: linear-gradient(180deg, #ffffff 0%, #e8f0ff 100%);
+  box-shadow: var(--shadow);
+}
+
+.voice-participant-label {
+  font-weight: 700;
+  font-size: 0.82rem;
+}
+
+.voice-participant-status {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.voice-participant-controls {
+  margin-top: 7px;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.voice-participant-controls input[type="range"] {
+  width: 100%;
+}
+
 .room-messages {
   min-height: 320px;
+}
+
+.room-search-bar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.room-search-status {
+  font-size: 0.78rem;
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.room-message.is-search-hidden {
+  display: none;
 }
 
 .room-message .message-meta {
@@ -787,8 +855,114 @@ select {
   font-size: 0.8rem;
 }
 
+.room-image-preview {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  padding: 9px;
+  border: 2px solid var(--line-dark);
+  border-top-color: var(--line-light);
+  border-left-color: var(--line-light);
+  background: linear-gradient(180deg, #ffffff 0%, #e8f0ff 100%);
+}
+
+.room-image-preview[hidden] {
+  display: none;
+}
+
+.room-image-preview-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.room-image-preview-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 5px 8px;
+  border: 2px solid var(--line-dark);
+  border-top-color: var(--line-light);
+  border-left-color: var(--line-light);
+  background: #ffffff;
+  font-size: 0.76rem;
+  font-weight: 700;
+  color: #18326c;
+  overflow-wrap: anywhere;
+  max-width: 100%;
+}
+
+.room-image-preview-meta {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.room-image-preview-meta span {
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: var(--accent-2);
+  overflow-wrap: anywhere;
+}
+
+.room-image-figure {
+  margin: 0 0 10px;
+}
+
+.room-message-image {
+  display: block;
+  width: min(100%, 520px);
+  max-height: 420px;
+  object-fit: contain;
+  border: 2px solid #3553a1;
+  border-top-color: var(--line-light);
+  border-left-color: var(--line-light);
+  background: #ffffff;
+}
+
+.room-image-figure figcaption {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.room-attachment-list {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.room-attachment-link {
+  display: inline-flex;
+  width: fit-content;
+  max-width: 100%;
+  padding: 5px 8px;
+  border: 2px solid var(--line-dark);
+  border-top-color: var(--line-light);
+  border-left-color: var(--line-light);
+  background: #fff4bd;
+  color: #13274e;
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+
+.room-attachment-link:hover {
+  background: #ffeb93;
+}
+
 @media (max-width: 900px) {
+  .room-search-bar {
+    grid-template-columns: 1fr;
+  }
   .room-connection-actions {
+    grid-template-columns: 1fr;
+  }
+  .room-voice-actions {
+    grid-template-columns: 1fr;
+  }
+  .voice-participant-controls {
     grid-template-columns: 1fr;
   }
 }
@@ -1078,7 +1252,7 @@ select {
 
 .asset-layout {
   display: grid;
-  grid-template-columns: 220px minmax(0, 1fr);
+  grid-template-columns: 320px minmax(0, 1fr);
   gap: 12px;
   min-height: 0;
 }
@@ -1427,7 +1601,7 @@ body.drafter-page .drafter-page-shell {
 }
 
 .drafter-page .drafter-layout {
-  --drafter-left-width: 300px;
+  --drafter-left-width: 380px;
   --drafter-right-width: 300px;
   display: grid;
   grid-template-columns: var(--drafter-left-width) 12px minmax(0, 1fr) 12px var(--drafter-right-width);

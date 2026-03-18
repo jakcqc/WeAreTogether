@@ -100,6 +100,18 @@
                 <button id="focus-room-button" class="secondary-button" type="button" disabled>Focus Mode: Off</button>
               </div>
             </div>
+
+            <div class="pixel-box">
+              <div class="pixel-box-title">Voice Channel</div>
+              <div class="pixel-box-body">
+                <p><strong>Mic:</strong> join voice chat and stream local audio.</p>
+                <div class="room-voice-actions">
+                  <button id="voice-join-button" class="secondary-button" type="button" disabled>Join Voice</button>
+                  <button id="voice-mute-button" class="secondary-button" type="button" disabled>Mute Mic</button>
+                </div>
+                <div id="voice-participant-list" class="voice-participant-list"></div>
+              </div>
+            </div>
           </div>
 
           <div class="sidebar-bottom">
@@ -129,12 +141,26 @@
                 </div>
               </section>
 
+              <div class="room-search-bar">
+                <input id="room-search-input" class="select-input" type="text" placeholder="Search transcript (fuzzy)">
+                <span id="room-search-status" class="room-search-status">0 matches</span>
+                <button id="room-search-clear-button" class="secondary-button" type="button">Clear</button>
+              </div>
               <section id="room-messages" class="messages room-messages"></section>
 
               <footer class="composer-shell">
                 <div class="composer">
+                  <input id="room-image-input" class="asset-upload-input" type="file" multiple>
+                  <div id="room-image-preview" class="room-image-preview" hidden>
+                    <div id="room-image-preview-list" class="room-image-preview-list"></div>
+                    <div class="room-image-preview-meta">
+                      <span id="room-image-preview-name">No files selected</span>
+                      <button id="room-image-clear-button" class="icon-button" type="button">Clear</button>
+                    </div>
+                  </div>
                   <textarea id="room-message-input" placeholder="Chat with the room. Use @ai to ask your room agent." rows="1"></textarea>
                   <div class="composer-actions">
+                    <button id="pick-room-image-button" class="secondary-button" type="button" disabled>Add Files</button>
                     <button id="send-room-button" class="primary-button" type="button" disabled>Send To Room</button>
                   </div>
                 </div>

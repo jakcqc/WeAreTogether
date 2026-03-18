@@ -10,6 +10,7 @@ dependencies = [
   "google-genai>=1.30.0",
   "openai>=1.76.0",
   "python-dotenv>=1.1.0",
+  "python-multipart>=0.0.22",
   "uvicorn[standard]>=0.34.0",
 ]
 

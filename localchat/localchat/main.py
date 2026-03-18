@@ -11,10 +11,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib import error, request as urllib_request
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -39,11 +39,14 @@ ROOM_STATE_PATH = BASE_DIR / "room_state.json"
 ROOM_HISTORY_LIMIT = 120
 ROOM_CONTEXT_MESSAGE_LIMIT = 18
 ROOM_CONTEXT_CHAR_BUDGET = 16000
+ROOM_IMAGE_DATA_URL_MAX_CHARS = 2_000_000
+ROOM_CHAT_ATTACHMENT_NAME_MAX_CHARS = 160
 DRAFT_CHAT_HISTORY_LIMIT = 80
 DRAFTER_TEXT_ASSET_LIMIT = 250_000
 DRAFTER_IMAGE_ASSET_LIMIT = 3_500_000
 DRAFTER_ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
 DRAFTER_ALLOWED_TEXT_EXTENSIONS = {".bib", ".tex"}
+ROOM_UPLOADS_DIR = STATIC_DIR / "room_uploads"
 ROOM_AI_SYSTEM_PROMPT = (
     "You are a participant-owned AI assistant inside a small multi-user chat room. "
     "Reply naturally to the room, keep answers concise, and use the recent chat context. "
@@ -52,6 +55,7 @@ ROOM_AI_SYSTEM_PROMPT = (
 
 app = FastAPI(title="Local Chat", version="0.1.0")
 DRAFTER_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+ROOM_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/assets", StaticFiles(directory=STATIC_DIR), name="assets")
 app.mount("/downloads", StaticFiles(directory=DOWNLOADS_DIR), name="downloads")
 app.add_middleware(
@@ -80,6 +84,15 @@ class RoomState:
     clients: set[WebSocket] = field(default_factory=set)
     history: list[dict[str, Any]] = field(default_factory=list)
     focus_mode: bool = False
+    participants: dict[WebSocket, "RoomParticipant"] = field(default_factory=dict)
+
+
+@dataclass
+class RoomParticipant:
+    participant_id: str
+    username: str
+    voice_enabled: bool = False
+    mic_muted: bool = True
 
 
 @dataclass
@@ -103,24 +116,34 @@ class RoomHub:
         self._rooms: dict[str, RoomState] = self._load_rooms()
         self._lock = asyncio.Lock()
 
-    async def connect(self, room_name: str, websocket: WebSocket) -> dict[str, Any]:
+    async def connect(self, room_name: str, websocket: WebSocket, username: str) -> dict[str, Any]:
         await websocket.accept()
         async with self._lock:
             room = self._rooms.setdefault(room_name, RoomState())
             room.clients.add(websocket)
+            participant_ids = {participant.participant_id for participant in room.participants.values()}
+            participant_id = self._next_participant_id(participant_ids)
+            room.participants[websocket] = RoomParticipant(
+                participant_id=participant_id,
+                username=username,
+            )
             return {
                 "messages": list(room.history),
                 "focusMode": room.focus_mode,
+                "participantId": participant_id,
+                "participants": self._serialize_participants(room),
             }
 
-    async def disconnect(self, room_name: str, websocket: WebSocket) -> None:
+    async def disconnect(self, room_name: str, websocket: WebSocket) -> RoomParticipant | None:
         async with self._lock:
             room = self._rooms.get(room_name)
             if room is None:
-                return
+                return None
             room.clients.discard(websocket)
+            participant = room.participants.pop(websocket, None)
             if not room.clients and not room.history:
                 self._rooms.pop(room_name, None)
+            return participant
 
     async def snapshot(self, room_name: str) -> list[dict[str, Any]]:
         async with self._lock:
@@ -152,6 +175,50 @@ class RoomHub:
             room.focus_mode = enabled
             self._persist_locked()
             return True
+
+    async def participants_snapshot(self, room_name: str) -> list[dict[str, Any]]:
+        async with self._lock:
+            room = self._rooms.get(room_name)
+            if room is None:
+                return []
+            return self._serialize_participants(room)
+
+    async def update_voice_state(
+        self,
+        room_name: str,
+        websocket: WebSocket,
+        *,
+        voice_enabled: bool,
+        mic_muted: bool,
+    ) -> list[dict[str, Any]]:
+        async with self._lock:
+            room = self._rooms.get(room_name)
+            if room is None:
+                return []
+            participant = room.participants.get(websocket)
+            if participant is None:
+                return []
+            participant.voice_enabled = voice_enabled
+            participant.mic_muted = mic_muted if voice_enabled else True
+            return self._serialize_participants(room)
+
+    async def resolve_voice_target(
+        self,
+        room_name: str,
+        source_socket: WebSocket,
+        target_participant_id: str,
+    ) -> tuple[WebSocket | None, RoomParticipant | None]:
+        async with self._lock:
+            room = self._rooms.get(room_name)
+            if room is None:
+                return None, None
+            source_participant = room.participants.get(source_socket)
+            target_socket = None
+            for socket, participant in room.participants.items():
+                if participant.participant_id == target_participant_id:
+                    target_socket = socket
+                    break
+            return target_socket, source_participant
 
     async def toggle_reaction(
         self,
@@ -207,6 +274,25 @@ class RoomHub:
 
         for client in stale_clients:
             await self.disconnect(room_name, client)
+
+    def _serialize_participants(self, room: RoomState) -> list[dict[str, Any]]:
+        participants = [
+            {
+                "participantId": participant.participant_id,
+                "name": participant.username,
+                "voiceEnabled": participant.voice_enabled,
+                "micMuted": participant.mic_muted,
+            }
+            for participant in room.participants.values()
+        ]
+        participants.sort(key=lambda item: str(item["name"]).lower())
+        return participants
+
+    def _next_participant_id(self, taken_ids: set[str]) -> str:
+        while True:
+            candidate = secrets.token_hex(6)
+            if candidate not in taken_ids:
+                return candidate
 
     def _load_rooms(self) -> dict[str, RoomState]:
         if not ROOM_STATE_PATH.exists():
@@ -471,7 +557,11 @@ async def drafter_page(request: Request) -> FileResponse:
 
 @app.get("/api/drafter/assets")
 async def api_drafter_assets(request: Request) -> list[dict[str, Any]]:
-    ensure_collaboration_page_access(request)
+    if not collaboration_client_allowed(request):
+        raise HTTPException(
+            status_code=403,
+            detail="Collaboration is limited to localhost or allowlisted client IPs.",
+        )
     assets = [
         serialize_drafter_asset(path)
         for path in sorted(DRAFTER_ASSETS_DIR.iterdir(), key=lambda item: item.name.lower())
@@ -483,7 +573,11 @@ async def api_drafter_assets(request: Request) -> list[dict[str, Any]]:
 
 @app.post("/api/drafter/assets")
 async def create_drafter_asset(request: Request, payload: dict[str, Any]) -> dict[str, Any]:
-    ensure_collaboration_page_access(request)
+    if not collaboration_client_allowed(request):
+        raise HTTPException(
+            status_code=403,
+            detail="Collaboration is limited to localhost or allowlisted client IPs.",
+        )
     asset_name = normalize_drafter_asset_name(payload.get("name"))
     asset_kind = drafter_asset_kind(asset_name)
     if not asset_kind:
@@ -515,13 +609,62 @@ async def create_drafter_asset(request: Request, payload: dict[str, Any]) -> dic
 
 @app.delete("/api/drafter/assets/{asset_name}")
 async def delete_drafter_asset(request: Request, asset_name: str) -> dict[str, str]:
-    ensure_collaboration_page_access(request)
+    if not collaboration_client_allowed(request):
+        raise HTTPException(
+            status_code=403,
+            detail="Collaboration is limited to localhost or allowlisted client IPs.",
+        )
     normalized_name = normalize_drafter_asset_name(asset_name)
     asset_path = DRAFTER_ASSETS_DIR / normalized_name
     if not asset_path.is_file() or not drafter_asset_kind(asset_path.name):
         raise HTTPException(status_code=404, detail="Asset not found.")
     asset_path.unlink(missing_ok=False)
     return {"status": "deleted", "name": normalized_name}
+
+
+@app.post("/api/rooms/{room_name}/attachments")
+async def upload_room_attachments(
+    request: Request,
+    room_name: str,
+    files: list[UploadFile] = File(...),
+) -> dict[str, Any]:
+    if not collaboration_client_allowed(request):
+        raise HTTPException(
+            status_code=403,
+            detail="Room uploads are limited to localhost or allowlisted client IPs.",
+        )
+
+    normalized_room = normalize_room_name(room_name, fallback="lobby")
+    if len(files) == 0:
+        raise HTTPException(status_code=400, detail="At least one attachment is required.")
+
+    room_dir = ROOM_UPLOADS_DIR / normalized_room
+    room_dir.mkdir(parents=True, exist_ok=True)
+    request_base = str(request.base_url).rstrip("/")
+    uploaded: list[dict[str, Any]] = []
+
+    for upload in files:
+        normalized_name = normalize_room_attachment_name(upload.filename)
+        stored_name = f"{int(time.time() * 1000)}-{secrets.token_hex(6)}-{normalized_name}"
+        destination = room_dir / stored_name
+        size = await write_upload_to_disk(upload, destination, max_bytes=None)
+        mime_type = str(upload.content_type or "").strip()[:120]
+        attachment_type = room_attachment_type_from_name_or_mime(normalized_name, mime_type)
+        url = f"{request_base}/assets/room_uploads/{quote(normalized_room)}/{quote(stored_name)}"
+        uploaded.append(
+            {
+                "type": attachment_type,
+                "name": normalized_name,
+                "url": url,
+                "size": size,
+                "mimeType": mime_type,
+            }
+        )
+
+    return {
+        "room": normalized_room,
+        "attachments": uploaded,
+    }
 
 
 @app.get("/health")
@@ -615,7 +758,7 @@ async def room_socket(websocket: WebSocket, room_name: str) -> None:
         return
     normalized_room = normalize_room_name(room_name)
     username = normalize_room_name(websocket.query_params.get("name") or "guest", fallback="guest")
-    snapshot = await room_hub.connect(normalized_room, websocket)
+    snapshot = await room_hub.connect(normalized_room, websocket, username=username)
     pending_ai_requests: dict[str, dict[str, str]] = {}
 
     try:
@@ -626,7 +769,18 @@ async def room_socket(websocket: WebSocket, room_name: str) -> None:
                 "messages": snapshot["messages"],
                 "focusMode": bool(snapshot.get("focusMode")),
                 "canDeleteMessages": can_manage_room_messages(websocket),
+                "participantId": snapshot.get("participantId"),
+                "participants": snapshot.get("participants", []),
             }
+        )
+        await room_hub.broadcast(
+            normalized_room,
+            {
+                "type": "voice_participants",
+                "participants": await room_hub.participants_snapshot(normalized_room),
+                "updatedBy": username,
+                "updatedAt": int(time.time() * 1000),
+            },
         )
         await room_hub.append_and_broadcast(
             normalized_room,
@@ -709,6 +863,50 @@ async def room_socket(websocket: WebSocket, room_name: str) -> None:
                 )
                 continue
 
+            if event_type == "voice_state":
+                participants = await room_hub.update_voice_state(
+                    normalized_room,
+                    websocket,
+                    voice_enabled=bool(payload.get("enabled")),
+                    mic_muted=bool(payload.get("muted")),
+                )
+                await room_hub.broadcast(
+                    normalized_room,
+                    {
+                        "type": "voice_participants",
+                        "participants": participants,
+                        "updatedBy": username,
+                        "updatedAt": int(time.time() * 1000),
+                    },
+                )
+                continue
+
+            if event_type == "voice_signal":
+                target_participant_id = str(payload.get("targetParticipantId") or "").strip()
+                signal_payload = payload.get("signal")
+                if not target_participant_id or not isinstance(signal_payload, dict):
+                    continue
+                target_socket, source_participant = await room_hub.resolve_voice_target(
+                    normalized_room,
+                    websocket,
+                    target_participant_id,
+                )
+                if target_socket is None or source_participant is None:
+                    continue
+                try:
+                    await target_socket.send_json(
+                        {
+                            "type": "voice_signal",
+                            "fromParticipantId": source_participant.participant_id,
+                            "fromName": source_participant.username,
+                            "signal": signal_payload,
+                            "sentAt": int(time.time() * 1000),
+                        }
+                    )
+                except Exception:
+                    pass
+                continue
+
             if event_type == "ai_result":
                 request_id = str(payload.get("requestId") or "").strip()
                 pending = pending_ai_requests.pop(request_id, None)
@@ -750,8 +948,23 @@ async def room_socket(websocket: WebSocket, room_name: str) -> None:
             if event_type != "chat":
                 continue
 
+            message_type = str(payload.get("messageType") or "text").strip().lower()
             content = str(payload.get("content") or "").strip()
-            if not content:
+            image_data_url = normalize_room_image_data_url(payload.get("imageData"))
+            image_name = normalize_room_image_name(payload.get("imageName"))
+            attachments = normalize_room_chat_attachments(payload.get("attachments"))
+            if image_data_url:
+                attachments.insert(
+                    0,
+                    {
+                        "type": "image",
+                        "name": image_name,
+                        "dataUrl": image_data_url,
+                        "size": 0,
+                        "mimeType": "image/*",
+                    },
+                )
+            if not content and not attachments:
                 continue
 
             agent_name = normalize_room_label(payload.get("agentName") or f"{username} ai", fallback=f"{username} ai")
@@ -768,10 +981,16 @@ async def room_socket(websocket: WebSocket, room_name: str) -> None:
                 speaker_type="user",
                 content=content,
                 model_id=model_id,
+                message_type=(
+                    "image"
+                    if any(str(item.get("type") or "").lower() == "image" for item in attachments)
+                    else message_type
+                ),
+                attachments=attachments,
             )
             await room_hub.append_and_broadcast(normalized_room, user_message)
 
-            if mentions_ai(content):
+            if content and mentions_ai(content):
                 request_id = secrets.token_hex(8)
                 history = await room_hub.snapshot(normalized_room)
                 ai_messages = build_room_ai_messages(
@@ -811,7 +1030,26 @@ async def room_socket(websocket: WebSocket, room_name: str) -> None:
     except WebSocketDisconnect:
         pass
     finally:
-        await room_hub.disconnect(normalized_room, websocket)
+        departed_participant = await room_hub.disconnect(normalized_room, websocket)
+        await room_hub.broadcast(
+            normalized_room,
+            {
+                "type": "voice_participants",
+                "participants": await room_hub.participants_snapshot(normalized_room),
+                "updatedBy": username,
+                "updatedAt": int(time.time() * 1000),
+            },
+        )
+        if departed_participant is not None:
+            await room_hub.broadcast(
+                normalized_room,
+                {
+                    "type": "voice_participant_left",
+                    "participantId": departed_participant.participant_id,
+                    "name": departed_participant.username,
+                    "updatedAt": int(time.time() * 1000),
+                },
+            )
         await room_hub.append_and_broadcast(
             normalized_room,
             build_room_event(
@@ -917,6 +1155,8 @@ def collaboration_client_allowed(connection: Request | WebSocket) -> bool:
     if not settings.collaboration_allow_remote_clients:
         return False
     allowed_hosts = set(settings.collaboration_allowed_client_ips)
+    if not allowed_hosts:
+        return True
     return "*" in allowed_hosts or host in allowed_hosts
 
 
@@ -926,6 +1166,8 @@ def can_manage_room_messages(connection: Request | WebSocket) -> bool:
         return True
     settings = get_settings()
     allowed_hosts = set(settings.collaboration_allowed_client_ips)
+    if settings.collaboration_allow_remote_clients and not allowed_hosts:
+        return True
     return "*" in allowed_hosts or host in allowed_hosts
 
 
@@ -953,6 +1195,8 @@ def build_room_event(
     speaker_type: str,
     content: str,
     model_id: str = "",
+    message_type: str = "text",
+    attachments: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     return {
         "id": secrets.token_hex(10),
@@ -961,6 +1205,8 @@ def build_room_event(
         "speakerType": speaker_type,
         "content": content,
         "modelId": model_id,
+        "messageType": message_type if message_type in {"text", "image", "file"} else "text",
+        "attachments": [item for item in (attachments or []) if isinstance(item, dict)],
         "createdAt": int(time.time() * 1000),
     }
 
@@ -986,6 +1232,109 @@ def normalize_reaction_emoji(value: Any) -> str:
         return ""
     candidate = re.sub(r"\s+", "", candidate)
     return candidate[:16]
+
+
+def normalize_room_image_name(value: Any) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(value or "").strip()).strip("-")
+    return cleaned[:72] or "shared-image"
+
+
+def normalize_room_image_data_url(value: Any) -> str:
+    candidate = str(value or "").strip()
+    if not candidate:
+        return ""
+    if len(candidate) > ROOM_IMAGE_DATA_URL_MAX_CHARS:
+        return ""
+    pattern = re.compile(r"^data:image\/(png|jpe?g|gif|webp);base64,[A-Za-z0-9+/=]+$", flags=re.IGNORECASE)
+    if not pattern.match(candidate):
+        return ""
+    return candidate
+
+
+def normalize_room_attachment_name(value: Any) -> str:
+    raw_name = Path(str(value or "")).name.strip()
+    cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", raw_name).strip(" ._-")
+    return cleaned[:ROOM_CHAT_ATTACHMENT_NAME_MAX_CHARS] or "shared-file"
+
+
+def normalize_room_attachment_url(value: Any) -> str:
+    candidate = str(value or "").strip()
+    if not candidate or len(candidate) > 600:
+        return ""
+    if ".." in candidate:
+        return ""
+    if candidate.startswith("/"):
+        if re.match(r"^/assets/room_uploads/[A-Za-z0-9._%/\-]+$", candidate):
+            return candidate
+        return ""
+    parsed = urlparse(candidate)
+    if parsed.scheme not in {"http", "https"}:
+        return ""
+    if not parsed.netloc:
+        return ""
+    if not re.match(r"^/assets/room_uploads/[A-Za-z0-9._%/\-]+$", parsed.path or ""):
+        return ""
+    return candidate
+
+
+def room_attachment_type_from_name_or_mime(name: str, mime_type: str) -> str:
+    mime = str(mime_type or "").strip().lower()
+    if mime.startswith("image/"):
+        return "image"
+    if Path(name).suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".avif"}:
+        return "image"
+    return "file"
+
+
+def normalize_room_chat_attachments(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        url = normalize_room_attachment_url(item.get("url"))
+        if not url:
+            continue
+        name = normalize_room_attachment_name(item.get("name"))
+        mime_type = str(item.get("mimeType") or "").strip()[:120]
+        normalized.append(
+            {
+                "type": room_attachment_type_from_name_or_mime(name, mime_type),
+                "name": name,
+                "url": url,
+                "size": max(0, clamp_int(item.get("size"), default=0, minimum=0, maximum=9_223_372_036_854_775_807)),
+                "mimeType": mime_type,
+            }
+        )
+    return normalized
+
+
+async def write_upload_to_disk(upload: UploadFile, destination: Path, *, max_bytes: int | None) -> int:
+    total = 0
+    try:
+        with destination.open("wb") as file_handle:
+            while True:
+                chunk = await upload.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if max_bytes is not None and total > max_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Attachment exceeds {max_bytes} bytes ({upload.filename or 'file'}).",
+                    )
+                file_handle.write(chunk)
+    except HTTPException:
+        destination.unlink(missing_ok=True)
+        raise
+    except OSError as exc:
+        destination.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail="Could not save uploaded attachment.") from exc
+    finally:
+        await upload.close()
+    return total
 
 
 def normalize_draft_content(value: Any) -> str:
@@ -1113,6 +1462,29 @@ def build_room_ai_messages(
             continue
         sender = str(item.get("sender") or "guest")
         content = str(item.get("content") or "").strip()
+        attachments = item.get("attachments") if isinstance(item.get("attachments"), list) else []
+        has_image = any(
+            isinstance(attachment, dict) and str(attachment.get("type") or "").lower() == "image"
+            for attachment in attachments
+        )
+        file_attachments = [
+            attachment
+            for attachment in attachments
+            if isinstance(attachment, dict) and str(attachment.get("type") or "").lower() == "file"
+        ]
+        if has_image:
+            image_note = f"{sender} shared an image."
+            if content:
+                image_note = f"{image_note} Caption: {content}"
+            content = image_note
+        elif file_attachments:
+            file_note = f"{sender} shared {len(file_attachments)} file"
+            if len(file_attachments) != 1:
+                file_note = f"{file_note}s"
+            file_note = f"{file_note}."
+            if content:
+                file_note = f"{file_note} Caption: {content}"
+            content = file_note
         if not content:
             continue
 

@@ -3,6 +3,9 @@ const ROOM_AGENTS_KEY = "localchat.roomAgents.v1";
 const DEFAULT_AGENT_ID = "custom";
 const DEFAULT_MODEL_ID = "ollama:qwen2.5:7b";
 const DEFAULT_AI_RUNTIME_URL = "http://127.0.0.1:11434";
+const WEBRTC_CONFIG = {
+  iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+};
 const QUICK_REACTION_EMOJIS = ["👍", "❤️", "😂", "🔥", "🎉"];
 const EDGE_ADS = {
   horizontal: [
@@ -33,6 +36,12 @@ const elements = {
   edgeAdTop: document.querySelector("#edge-ad-top"),
   emptyState: document.querySelector("#room-empty-state"),
   focusButton: document.querySelector("#focus-room-button"),
+  imageClearButton: document.querySelector("#room-image-clear-button"),
+  imageInput: document.querySelector("#room-image-input"),
+  imagePickButton: document.querySelector("#pick-room-image-button"),
+  imagePreview: document.querySelector("#room-image-preview"),
+  imagePreviewList: document.querySelector("#room-image-preview-list"),
+  imagePreviewName: document.querySelector("#room-image-preview-name"),
   maxTokensInput: document.querySelector("#room-max-tokens-input"),
   messageInput: document.querySelector("#room-message-input"),
   messages: document.querySelector("#room-messages"),
@@ -44,11 +53,17 @@ const elements = {
   roomInput: document.querySelector("#room-name-input"),
   runtimeLabel: document.querySelector("#room-runtime-label"),
   saveAgentButton: document.querySelector("#save-room-agent-button"),
+  searchClearButton: document.querySelector("#room-search-clear-button"),
+  searchInput: document.querySelector("#room-search-input"),
+  searchStatus: document.querySelector("#room-search-status"),
   sendButton: document.querySelector("#send-room-button"),
   serverInput: document.querySelector("#server-url-input"),
   statusPill: document.querySelector("#room-status-pill"),
   systemPromptInput: document.querySelector("#room-system-prompt"),
   temperatureInput: document.querySelector("#room-temperature-input"),
+  voiceJoinButton: document.querySelector("#voice-join-button"),
+  voiceMuteButton: document.querySelector("#voice-mute-button"),
+  voiceParticipantList: document.querySelector("#voice-participant-list"),
 };
 
 marked.setOptions({
@@ -65,6 +80,16 @@ let roomSocket = null;
 let resolvedClientRuntimeBase = "";
 let canDeleteMessages = false;
 let roomFocusMode = false;
+let roomParticipantId = "";
+let roomParticipants = [];
+let pendingRoomAttachments = [];
+let roomSearchQuery = "";
+let localMicMuted = true;
+let voiceSessionJoined = false;
+let localVoiceStream = null;
+let peerConnections = new Map();
+let participantAudioElements = new Map();
+let participantAudioState = new Map();
 
 applyRoomSettingsToForm();
 renderEdgeAds();
@@ -73,6 +98,9 @@ applySelectedRoomAgent();
 updateRoomMeta();
 updateRoomEmptyState();
 autoGrow(elements.messageInput);
+renderPendingImageAttachment();
+renderVoiceParticipants();
+applyRoomSearchFilter();
 await resolveClientRuntimeBase();
 await loadModelsForRuntime();
 bindEvents();
@@ -81,18 +109,27 @@ applySharedFocusMode(roomFocusMode);
 function bindEvents() {
   elements.connectButton.addEventListener("click", () => connectToRoom());
   elements.disconnectButton.addEventListener("click", () => disconnectFromRoom());
-  elements.sendButton.addEventListener("click", () => sendRoomMessage());
+  elements.sendButton.addEventListener("click", () => void sendRoomMessage());
   elements.focusButton?.addEventListener("click", () => toggleSharedFocusMode());
+  elements.imagePickButton?.addEventListener("click", () => elements.imageInput?.click());
+  elements.imageInput?.addEventListener("change", (event) => onImageInputChange(event));
+  elements.imageClearButton?.addEventListener("click", clearPendingImageAttachment);
+  elements.voiceJoinButton?.addEventListener("click", () => toggleVoiceSession());
+  elements.voiceMuteButton?.addEventListener("click", () => toggleLocalMute());
+  elements.voiceParticipantList?.addEventListener("input", (event) => onVoiceParticipantControl(event));
+  elements.voiceParticipantList?.addEventListener("click", (event) => onVoiceParticipantControl(event));
   elements.saveAgentButton.addEventListener("click", saveRoomAgent);
   elements.deleteAgentButton.addEventListener("click", deleteRoomAgent);
   elements.agentSelect.addEventListener("change", onRoomAgentChange);
   elements.messages.addEventListener("click", onRoomMessageActionClick);
+  elements.searchInput?.addEventListener("input", () => onRoomSearchInput());
+  elements.searchClearButton?.addEventListener("click", clearRoomSearch);
 
   elements.messageInput.addEventListener("input", () => autoGrow(elements.messageInput));
   elements.messageInput.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
-      sendRoomMessage();
+      void sendRoomMessage();
     }
   });
 
@@ -428,8 +465,15 @@ async function connectToRoom() {
   roomSocket.addEventListener("open", () => {
     updateStatus(`Connected to #${roomSettings.roomName}`);
     elements.sendButton.disabled = false;
+    if (elements.imagePickButton) {
+      elements.imagePickButton.disabled = false;
+    }
     elements.disconnectButton.disabled = false;
     elements.connectButton.disabled = true;
+    if (elements.voiceJoinButton) {
+      elements.voiceJoinButton.disabled = false;
+    }
+    updateVoiceUiState();
     if (elements.focusButton) {
       elements.focusButton.disabled = false;
     }
@@ -438,10 +482,24 @@ async function connectToRoom() {
 
   roomSocket.addEventListener("message", (event) => handleSocketMessage(event.data));
   roomSocket.addEventListener("close", (event) => {
+    closeVoiceSession({ notify: false });
+    clearPendingImageAttachment();
+    roomParticipantId = "";
+    roomParticipants = [];
+    renderVoiceParticipants();
     updateStatus("Disconnected");
     elements.sendButton.disabled = true;
+    if (elements.imagePickButton) {
+      elements.imagePickButton.disabled = true;
+    }
     elements.disconnectButton.disabled = true;
     elements.connectButton.disabled = false;
+    if (elements.voiceJoinButton) {
+      elements.voiceJoinButton.disabled = true;
+    }
+    if (elements.voiceMuteButton) {
+      elements.voiceMuteButton.disabled = true;
+    }
     if (elements.focusButton) {
       elements.focusButton.disabled = true;
     }
@@ -463,16 +521,29 @@ function disconnectFromRoom() {
   roomSocket.close();
 }
 
-function sendRoomMessage() {
+async function sendRoomMessage() {
   const content = elements.messageInput.value.trim();
-  if (!content || !roomSocket || roomSocket.readyState !== WebSocket.OPEN) {
+  const messageType = pendingRoomAttachments.length ? "file" : "text";
+  if ((!content && !pendingRoomAttachments.length) || !roomSocket || roomSocket.readyState !== WebSocket.OPEN) {
     return;
+  }
+
+  let uploadedAttachments = [];
+  if (pendingRoomAttachments.length) {
+    try {
+      uploadedAttachments = await uploadPendingRoomAttachments();
+    } catch (error) {
+      appendLocalSystemMessage(`Attachment upload failed: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
   }
 
   persistRoomSettingsFromForm();
   roomSocket.send(JSON.stringify({
     type: "chat",
+    messageType,
     content,
+    attachments: uploadedAttachments,
     agentName: roomSettings.agentName,
     systemPrompt: roomSettings.systemPrompt,
     modelId: roomSettings.modelId,
@@ -483,6 +554,36 @@ function sendRoomMessage() {
 
   elements.messageInput.value = "";
   autoGrow(elements.messageInput);
+  clearPendingImageAttachment();
+}
+
+async function uploadPendingRoomAttachments() {
+  const serverBase = normalizeServerBase(roomSettings.serverUrl);
+  const roomName = normalizeRoomName(roomSettings.roomName);
+  const endpoint = `${serverBase}/api/rooms/${encodeURIComponent(roomName)}/attachments`;
+  const formData = new FormData();
+  pendingRoomAttachments.forEach((attachment) => {
+    formData.append("files", attachment.file, attachment.name);
+  });
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    mode: "cors",
+    body: formData,
+  });
+  if (!response.ok) {
+    let detail = response.statusText;
+    try {
+      const payload = await response.json();
+      detail = String(payload?.detail || detail);
+    } catch {
+      detail = await response.text();
+    }
+    throw new Error(`Upload request failed (${response.status}): ${detail}`);
+  }
+
+  const payload = await response.json();
+  return Array.isArray(payload?.attachments) ? payload.attachments : [];
 }
 
 function handleSocketMessage(rawPayload) {
@@ -500,8 +601,13 @@ function handleSocketMessage(rawPayload) {
   if (payload.type === "history") {
     elements.messages.innerHTML = "";
     canDeleteMessages = Boolean(payload.canDeleteMessages);
+    roomParticipantId = String(payload.participantId || "");
+    roomParticipants = Array.isArray(payload.participants) ? payload.participants : [];
     applySharedFocusMode(Boolean(payload.focusMode));
     payload.messages.forEach((message) => appendRoomMessage(message));
+    applyRoomSearchFilter();
+    renderVoiceParticipants();
+    syncVoicePeerConnections();
     updateRoomEmptyState();
     scrollMessagesToBottom();
     return;
@@ -519,6 +625,28 @@ function handleSocketMessage(rawPayload) {
 
   if (payload.type === "focus_mode") {
     applySharedFocusMode(Boolean(payload.enabled));
+    return;
+  }
+
+  if (payload.type === "voice_participants") {
+    roomParticipants = Array.isArray(payload.participants) ? payload.participants : [];
+    renderVoiceParticipants();
+    syncVoicePeerConnections();
+    return;
+  }
+
+  if (payload.type === "voice_participant_left") {
+    const departedId = String(payload.participantId || "");
+    if (departedId) {
+      roomParticipants = roomParticipants.filter((participant) => String(participant?.participantId || "") !== departedId);
+      closePeerConnection(departedId);
+      renderVoiceParticipants();
+    }
+    return;
+  }
+
+  if (payload.type === "voice_signal") {
+    void handleVoiceSignal(payload);
     return;
   }
 
@@ -589,6 +717,7 @@ function appendRoomMessage(message) {
   const article = document.createElement("article");
   article.className = `message room-message ${messageClassFor(message)}`;
   article.dataset.messageId = message.id || crypto.randomUUID();
+  article.dataset.searchText = buildRoomSearchText(message);
 
   const meta = document.createElement("div");
   meta.className = "message-meta";
@@ -599,9 +728,62 @@ function appendRoomMessage(message) {
 
   const content = document.createElement("div");
   content.className = "message-content markdown-body";
-  const rendered = marked.parse(message.content || "");
-  content.innerHTML = DOMPurify.sanitize(rendered);
-  enhanceRenderedMessage(content, message.content || "");
+  const attachments = Array.isArray(message.attachments) ? message.attachments : [];
+  const attachmentList = document.createElement("div");
+  attachmentList.className = "room-attachment-list";
+  let hasAttachmentContent = false;
+
+  attachments.forEach((attachment) => {
+    const attachmentType = String(attachment?.type || "").toLowerCase();
+    const attachmentName = String(attachment?.name || "attachment");
+    if (attachmentType === "image") {
+      const imageSource = String(attachment?.dataUrl || attachment?.url || "");
+      if (isSafeImageSource(imageSource)) {
+        const imageFigure = document.createElement("figure");
+        imageFigure.className = "room-image-figure";
+        const image = document.createElement("img");
+        image.className = "room-message-image";
+        image.loading = "lazy";
+        image.decoding = "async";
+        image.src = imageSource;
+        image.alt = attachmentName || "shared image";
+        imageFigure.append(image);
+        if (attachmentName) {
+          const caption = document.createElement("figcaption");
+          caption.textContent = attachmentName;
+          imageFigure.append(caption);
+        }
+        attachmentList.append(imageFigure);
+        hasAttachmentContent = true;
+        return;
+      }
+    }
+
+    const fileUrl = String(attachment?.url || "");
+    if (!isSafeRoomAssetUrl(fileUrl)) {
+      return;
+    }
+    const fileLink = document.createElement("a");
+    fileLink.className = "room-attachment-link";
+    fileLink.href = fileUrl;
+    fileLink.target = "_blank";
+    fileLink.rel = "noopener noreferrer";
+    fileLink.textContent = attachmentName;
+    attachmentList.append(fileLink);
+    hasAttachmentContent = true;
+  });
+
+  if (hasAttachmentContent) {
+    content.append(attachmentList);
+  }
+
+  if (message.content) {
+    const rendered = marked.parse(message.content || "");
+    const textContent = document.createElement("div");
+    textContent.innerHTML = DOMPurify.sanitize(rendered);
+    enhanceRenderedMessage(textContent, message.content || "");
+    content.append(textContent);
+  }
 
   const reactions = document.createElement("div");
   reactions.className = "message-reactions";
@@ -649,6 +831,7 @@ function appendRoomMessage(message) {
   article.append(meta, content, reactions, actions);
   renderMessageReactions(article, message.reactions || {});
   elements.messages.append(article);
+  applyRoomSearchFilter();
   updateRoomEmptyState();
   scrollMessagesToBottom();
 }
@@ -714,6 +897,7 @@ function removeMessageFromRoom(messageId) {
     return;
   }
   article.remove();
+  applyRoomSearchFilter();
   updateRoomEmptyState();
 }
 
@@ -751,6 +935,463 @@ function renderMessageReactions(article, reactions) {
     chip.textContent = `${entry.emoji} ${entry.count}`;
     container.append(chip);
   });
+}
+
+async function onImageInputChange(event) {
+  const input = event.target;
+  const selectedFiles = Array.from(input?.files || []);
+  if (!selectedFiles.length) {
+    return;
+  }
+
+  selectedFiles.forEach((file) => {
+    if (pendingRoomAttachments.some((item) => item.name === file.name && item.size === file.size)) {
+      return;
+    }
+    pendingRoomAttachments.push({
+      file,
+      name: file.name || "shared-file",
+      size: Number(file.size || 0),
+      mimeType: String(file.type || ""),
+    });
+  });
+
+  renderPendingImageAttachment();
+  input.value = "";
+}
+
+function clearPendingImageAttachment() {
+  pendingRoomAttachments = [];
+  renderPendingImageAttachment();
+}
+
+function renderPendingImageAttachment() {
+  if (!elements.imagePreview || !elements.imagePreviewList || !elements.imagePreviewName) {
+    return;
+  }
+  elements.imagePreviewList.innerHTML = "";
+  if (!pendingRoomAttachments.length) {
+    elements.imagePreview.hidden = true;
+    elements.imagePreviewName.textContent = "No files selected";
+    return;
+  }
+
+  elements.imagePreview.hidden = false;
+  pendingRoomAttachments.forEach((attachment) => {
+    const chip = document.createElement("span");
+    chip.className = "room-image-preview-chip";
+    chip.textContent = `${attachment.name} (${formatFileSize(attachment.size)})`;
+    elements.imagePreviewList.append(chip);
+  });
+  elements.imagePreviewName.textContent = `${pendingRoomAttachments.length} file(s) attached`;
+}
+
+function isSafeImageDataUrl(value) {
+  if (!value) {
+    return false;
+  }
+  return /^data:image\/(png|jpe?g|gif|webp);base64,[A-Za-z0-9+/=]+$/i.test(value);
+}
+
+function isSafeImageSource(value) {
+  if (!value) {
+    return false;
+  }
+  if (value.startsWith("data:")) {
+    return isSafeImageDataUrl(value);
+  }
+  return isSafeRoomAssetUrl(value);
+}
+
+function isSafeRoomAssetUrl(value) {
+  if (!value || value.length > 600 || value.includes("..")) {
+    return false;
+  }
+  if (/^\/assets\/room_uploads\/[A-Za-z0-9._%/-]+$/i.test(value)) {
+    return true;
+  }
+  try {
+    const parsed = new URL(value);
+    if (!/^https?:$/i.test(parsed.protocol)) {
+      return false;
+    }
+    return /^\/assets\/room_uploads\/[A-Za-z0-9._%/-]+$/i.test(parsed.pathname || "");
+  } catch {
+    return false;
+  }
+}
+
+function formatFileSize(bytes) {
+  const value = Number(bytes || 0);
+  if (!Number.isFinite(value) || value <= 0) {
+    return "0 B";
+  }
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const exponent = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1);
+  const amount = value / (1024 ** exponent);
+  const decimals = exponent <= 1 ? 0 : 1;
+  return `${amount.toFixed(decimals)} ${units[exponent]}`;
+}
+
+async function toggleVoiceSession() {
+  if (!voiceSessionJoined) {
+    await joinVoiceSession();
+    return;
+  }
+  closeVoiceSession({ notify: true });
+}
+
+async function joinVoiceSession() {
+  if (!roomSocket || roomSocket.readyState !== WebSocket.OPEN || voiceSessionJoined) {
+    return;
+  }
+  if (!navigator.mediaDevices?.getUserMedia) {
+    appendLocalSystemMessage("This browser does not support microphone access.");
+    return;
+  }
+  try {
+    localVoiceStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    voiceSessionJoined = true;
+    setLocalMuteState(localMicMuted, { broadcast: false });
+    sendVoiceState();
+    updateVoiceUiState();
+    renderVoiceParticipants();
+    syncVoicePeerConnections();
+  } catch (error) {
+    appendLocalSystemMessage(`Microphone access failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function closeVoiceSession({ notify }) {
+  for (const participantId of [...peerConnections.keys()]) {
+    closePeerConnection(participantId);
+  }
+  if (localVoiceStream) {
+    localVoiceStream.getTracks().forEach((track) => track.stop());
+  }
+  localVoiceStream = null;
+  voiceSessionJoined = false;
+  setLocalMuteState(true, { broadcast: false });
+  if (notify) {
+    sendVoiceState();
+  }
+  updateVoiceUiState();
+}
+
+function toggleLocalMute() {
+  setLocalMuteState(!localMicMuted);
+  updateVoiceUiState();
+}
+
+function setLocalMuteState(nextMuted, options = {}) {
+  localMicMuted = Boolean(nextMuted);
+  if (localVoiceStream) {
+    for (const track of localVoiceStream.getAudioTracks()) {
+      track.enabled = !localMicMuted;
+    }
+  }
+  if (options.broadcast !== false) {
+    sendVoiceState();
+  }
+}
+
+function sendVoiceState() {
+  if (!roomSocket || roomSocket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  roomSocket.send(JSON.stringify({
+    type: "voice_state",
+    enabled: voiceSessionJoined,
+    muted: localMicMuted,
+  }));
+}
+
+function updateVoiceUiState() {
+  if (elements.voiceJoinButton) {
+    elements.voiceJoinButton.textContent = voiceSessionJoined ? "Leave Voice" : "Join Voice";
+  }
+  if (elements.voiceMuteButton) {
+    elements.voiceMuteButton.disabled = !voiceSessionJoined;
+    elements.voiceMuteButton.textContent = localMicMuted ? "Unmute Mic" : "Mute Mic";
+  }
+}
+
+function renderVoiceParticipants() {
+  if (!elements.voiceParticipantList) {
+    return;
+  }
+
+  const knownIds = new Set(
+    roomParticipants
+      .map((participant) => String(participant?.participantId || ""))
+      .filter(Boolean),
+  );
+  for (const participantId of [...participantAudioState.keys()]) {
+    if (!knownIds.has(participantId)) {
+      participantAudioState.delete(participantId);
+    }
+  }
+
+  elements.voiceParticipantList.innerHTML = "";
+  if (!roomParticipants.length) {
+    const empty = document.createElement("p");
+    empty.className = "voice-participant-empty";
+    empty.textContent = "No active participants.";
+    elements.voiceParticipantList.append(empty);
+    return;
+  }
+
+  roomParticipants.forEach((participant) => {
+    const participantId = String(participant?.participantId || "");
+    if (!participantId) {
+      return;
+    }
+    const isSelf = participantId === roomParticipantId;
+    const voiceEnabled = Boolean(participant?.voiceEnabled);
+    const micMuted = Boolean(participant?.micMuted);
+    const state = participantAudioState.get(participantId) || { volume: 100, muted: false };
+    participantAudioState.set(participantId, state);
+
+    const row = document.createElement("div");
+    row.className = "voice-participant-row";
+    row.dataset.participantId = participantId;
+
+    const label = document.createElement("div");
+    label.className = "voice-participant-label";
+    label.textContent = `${participant?.name || "guest"}${isSelf ? " (you)" : ""}`;
+
+    const status = document.createElement("div");
+    status.className = "voice-participant-status";
+    status.textContent = voiceEnabled ? (micMuted ? "voice: muted" : "voice: live") : "voice: off";
+
+    row.append(label, status);
+
+    if (!isSelf) {
+      const controls = document.createElement("div");
+      controls.className = "voice-participant-controls";
+
+      const slider = document.createElement("input");
+      slider.type = "range";
+      slider.min = "0";
+      slider.max = "200";
+      slider.step = "1";
+      slider.value = String(state.volume);
+      slider.dataset.role = "volume";
+      slider.dataset.participantId = participantId;
+
+      const muteButton = document.createElement("button");
+      muteButton.type = "button";
+      muteButton.className = "icon-button";
+      muteButton.dataset.role = "mute-remote";
+      muteButton.dataset.participantId = participantId;
+      muteButton.textContent = state.muted ? "Unmute User" : "Mute User";
+
+      controls.append(slider, muteButton);
+      row.append(controls);
+    }
+
+    elements.voiceParticipantList.append(row);
+  });
+}
+
+function onVoiceParticipantControl(event) {
+  const target = event.target;
+  if (!(target instanceof HTMLElement)) {
+    return;
+  }
+
+  if (target.dataset.role === "volume") {
+    const participantId = String(target.dataset.participantId || "");
+    const value = Number(target.value || 100);
+    const state = participantAudioState.get(participantId) || { volume: 100, muted: false };
+    state.volume = Number.isFinite(value) ? Math.max(0, Math.min(200, value)) : 100;
+    participantAudioState.set(participantId, state);
+    applyRemoteAudioState(participantId);
+    return;
+  }
+
+  if (target.dataset.role === "mute-remote") {
+    const participantId = String(target.dataset.participantId || "");
+    const state = participantAudioState.get(participantId) || { volume: 100, muted: false };
+    state.muted = !state.muted;
+    participantAudioState.set(participantId, state);
+    applyRemoteAudioState(participantId);
+    renderVoiceParticipants();
+  }
+}
+
+function syncVoicePeerConnections() {
+  if (!voiceSessionJoined || !localVoiceStream || !roomParticipantId) {
+    for (const participantId of [...peerConnections.keys()]) {
+      closePeerConnection(participantId);
+    }
+    return;
+  }
+
+  const activeRemoteIds = new Set(
+    roomParticipants
+      .filter((participant) => participant?.voiceEnabled)
+      .map((participant) => String(participant?.participantId || ""))
+      .filter((participantId) => participantId && participantId !== roomParticipantId),
+  );
+
+  for (const participantId of [...peerConnections.keys()]) {
+    if (!activeRemoteIds.has(participantId)) {
+      closePeerConnection(participantId);
+    }
+  }
+
+  roomParticipants.forEach((participant) => {
+    const remoteId = String(participant?.participantId || "");
+    if (!remoteId || remoteId === roomParticipantId || !participant?.voiceEnabled) {
+      return;
+    }
+    ensurePeerConnection(remoteId);
+    if (roomParticipantId < remoteId) {
+      void createAndSendOffer(remoteId);
+    }
+  });
+}
+
+function ensurePeerConnection(remoteParticipantId) {
+  if (peerConnections.has(remoteParticipantId)) {
+    return peerConnections.get(remoteParticipantId);
+  }
+
+  const peerConnection = new RTCPeerConnection(WEBRTC_CONFIG);
+  if (localVoiceStream) {
+    localVoiceStream.getAudioTracks().forEach((track) => {
+      peerConnection.addTrack(track, localVoiceStream);
+    });
+  }
+
+  peerConnection.addEventListener("icecandidate", (event) => {
+    if (!event.candidate) {
+      return;
+    }
+    sendVoiceSignal(remoteParticipantId, {
+      type: "ice",
+      candidate: event.candidate,
+    });
+  });
+
+  peerConnection.addEventListener("track", (event) => {
+    const [stream] = event.streams;
+    if (!stream) {
+      return;
+    }
+    let audioElement = participantAudioElements.get(remoteParticipantId);
+    if (!audioElement) {
+      audioElement = document.createElement("audio");
+      audioElement.autoplay = true;
+      audioElement.playsInline = true;
+      participantAudioElements.set(remoteParticipantId, audioElement);
+    }
+    audioElement.srcObject = stream;
+    applyRemoteAudioState(remoteParticipantId);
+  });
+
+  peerConnections.set(remoteParticipantId, peerConnection);
+  return peerConnection;
+}
+
+async function createAndSendOffer(remoteParticipantId) {
+  const peerConnection = ensurePeerConnection(remoteParticipantId);
+  if (!peerConnection) {
+    return;
+  }
+  if (peerConnection.signalingState !== "stable") {
+    return;
+  }
+  const offer = await peerConnection.createOffer();
+  await peerConnection.setLocalDescription(offer);
+  sendVoiceSignal(remoteParticipantId, {
+    type: "offer",
+    sdp: peerConnection.localDescription,
+  });
+}
+
+async function handleVoiceSignal(payload) {
+  if (!voiceSessionJoined || !localVoiceStream) {
+    return;
+  }
+  const remoteParticipantId = String(payload.fromParticipantId || "");
+  const signal = payload.signal;
+  if (!remoteParticipantId || !signal || typeof signal !== "object") {
+    return;
+  }
+
+  const peerConnection = ensurePeerConnection(remoteParticipantId);
+  if (!peerConnection) {
+    return;
+  }
+
+  try {
+    if (signal.type === "offer" && signal.sdp) {
+      await peerConnection.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+      const answer = await peerConnection.createAnswer();
+      await peerConnection.setLocalDescription(answer);
+      sendVoiceSignal(remoteParticipantId, {
+        type: "answer",
+        sdp: peerConnection.localDescription,
+      });
+      return;
+    }
+
+    if (signal.type === "answer" && signal.sdp) {
+      await peerConnection.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+      return;
+    }
+
+    if (signal.type === "ice" && signal.candidate) {
+      await peerConnection.addIceCandidate(new RTCIceCandidate(signal.candidate));
+    }
+  } catch (error) {
+    appendLocalSystemMessage(`Voice signal error: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function sendVoiceSignal(targetParticipantId, signal) {
+  if (!roomSocket || roomSocket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  roomSocket.send(JSON.stringify({
+    type: "voice_signal",
+    targetParticipantId,
+    signal,
+  }));
+}
+
+function closePeerConnection(participantId) {
+  const peerConnection = peerConnections.get(participantId);
+  if (peerConnection) {
+    peerConnection.getSenders().forEach((sender) => {
+      try {
+        peerConnection.removeTrack(sender);
+      } catch {
+        return;
+      }
+    });
+    peerConnection.close();
+    peerConnections.delete(participantId);
+  }
+
+  const audioElement = participantAudioElements.get(participantId);
+  if (audioElement) {
+    audioElement.pause();
+    audioElement.srcObject = null;
+    participantAudioElements.delete(participantId);
+  }
+}
+
+function applyRemoteAudioState(participantId) {
+  const audioElement = participantAudioElements.get(participantId);
+  if (!audioElement) {
+    return;
+  }
+  const state = participantAudioState.get(participantId) || { volume: 100, muted: false };
+  audioElement.muted = Boolean(state.muted);
+  audioElement.volume = Math.max(0, Math.min(2, Number(state.volume || 100) / 100));
 }
 
 function getRoomLabel(message) {
@@ -845,6 +1486,104 @@ function updateRoomEmptyState() {
   const hasMessages = elements.messages.childElementCount > 0;
   elements.emptyState.style.display = hasMessages ? "none" : "grid";
   elements.messages.classList.toggle("active", hasMessages);
+}
+
+function onRoomSearchInput() {
+  roomSearchQuery = String(elements.searchInput?.value || "");
+  applyRoomSearchFilter();
+}
+
+function clearRoomSearch() {
+  roomSearchQuery = "";
+  if (elements.searchInput) {
+    elements.searchInput.value = "";
+  }
+  applyRoomSearchFilter();
+}
+
+function applyRoomSearchFilter() {
+  const messages = [...elements.messages.querySelectorAll(".room-message")];
+  const normalizedQuery = normalizeSearchText(roomSearchQuery);
+  if (!normalizedQuery) {
+    messages.forEach((message) => message.classList.remove("is-search-hidden"));
+    if (elements.searchStatus) {
+      elements.searchStatus.textContent = `${messages.length} messages`;
+    }
+    return;
+  }
+
+  const threshold = Math.max(8, normalizedQuery.length * 3);
+  let matchCount = 0;
+  messages.forEach((message) => {
+    const haystack = normalizeSearchText(message.dataset.searchText || "");
+    const score = fuzzyScore(normalizedQuery, haystack);
+    const isMatch = score >= threshold;
+    message.classList.toggle("is-search-hidden", !isMatch);
+    if (isMatch) {
+      matchCount += 1;
+    }
+  });
+
+  if (elements.searchStatus) {
+    elements.searchStatus.textContent = `${matchCount} match${matchCount === 1 ? "" : "es"}`;
+  }
+}
+
+function buildRoomSearchText(message) {
+  const sender = String(message?.sender || "");
+  const content = String(message?.content || "");
+  const modelId = String(message?.modelId || "");
+  const attachments = Array.isArray(message?.attachments) ? message.attachments : [];
+  const attachmentNames = attachments
+    .map((item) => String(item?.name || ""))
+    .filter(Boolean)
+    .join(" ");
+  return `${sender} ${content} ${modelId} ${attachmentNames}`.trim();
+}
+
+function normalizeSearchText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function fuzzyScore(query, text) {
+  if (!query || !text) {
+    return -1;
+  }
+
+  const directIndex = text.indexOf(query);
+  if (directIndex >= 0) {
+    return 1000 - Math.min(999, directIndex);
+  }
+
+  let score = 0;
+  let scanIndex = 0;
+  let firstMatchIndex = -1;
+  let lastMatchIndex = -2;
+
+  for (const char of query) {
+    const nextIndex = text.indexOf(char, scanIndex);
+    if (nextIndex < 0) {
+      return -1;
+    }
+    if (firstMatchIndex < 0) {
+      firstMatchIndex = nextIndex;
+    }
+    score += 5;
+    if (nextIndex === lastMatchIndex + 1) {
+      score += 3;
+    }
+    score -= Math.min(2, Math.max(0, nextIndex - scanIndex));
+    lastMatchIndex = nextIndex;
+    scanIndex = nextIndex + 1;
+  }
+
+  if (firstMatchIndex >= 0 && lastMatchIndex >= firstMatchIndex) {
+    score += Math.max(0, 30 - (lastMatchIndex - firstMatchIndex));
+  }
+  return score;
 }
 
 function scrollMessagesToBottom() {

@@ -8,10 +8,10 @@ const DEFAULT_MODEL_ID = "ollama:qwen2.5:7b";
 const SYNC_DEBOUNCE_MS = 180;
 const MAX_IMAGE_UPLOAD_BYTES = 3_500_000;
 const MAX_TEXT_UPLOAD_BYTES = 250_000;
-const DEFAULT_LEFT_RAIL_WIDTH = 300;
+const DEFAULT_LEFT_RAIL_WIDTH = 380;
 const DEFAULT_RIGHT_RAIL_WIDTH = 300;
 const MIN_RAIL_WIDTH = 220;
-const MAX_RAIL_WIDTH = 460;
+const MAX_RAIL_WIDTH = 760;
 const DEFAULT_LAYOUT = {
   left: ["overview", "ai", "proposal", "assets", "compile"],
   right: ["connection", "collaborators"],
@@ -1171,9 +1171,13 @@ function buildAskMessages(request) {
     "When useful, cite specific sections or passages from the current draft.",
     drafterSettings.systemPrompt || "",
   ].filter(Boolean).join(" ");
+  const assetsContext = buildDrafterAssetsContext();
   return [
     { role: "system", content: system },
-    { role: "user", content: `Current paper:\n\n${drafterSettings.paper}\n\nQuestion:\n${request}` },
+    {
+      role: "user",
+      content: `Current paper:\n\n${drafterSettings.paper}\n\nUploaded assets:\n${assetsContext}\n\nQuestion:\n${request}`,
+    },
   ];
 }
 
@@ -1185,12 +1189,53 @@ function buildAgentMessages(request) {
     "First section: EXPLANATION: followed by a concise explanation.",
     "Second section: DIFF: followed by a unified diff patch against the current LaTeX content.",
     "The diff must update only main.tex content and be directly reviewable by a human.",
+    "Use uploaded assets when relevant and reference them by their provided referencePath.",
     drafterSettings.systemPrompt || "",
   ].filter(Boolean).join(" ");
+  const assetsContext = buildDrafterAssetsContext();
   return [
     { role: "system", content: system },
-    { role: "user", content: `Current file: main.tex\n\n${drafterSettings.paper}\n\nUser request:\n${request}` },
+    {
+      role: "user",
+      content: `Current file: main.tex\n\n${drafterSettings.paper}\n\nUploaded assets:\n${assetsContext}\n\nUser request:\n${request}`,
+    },
   ];
+}
+
+function buildDrafterAssetsContext() {
+  if (!Array.isArray(drafterAssets) || !drafterAssets.length) {
+    return "None.";
+  }
+
+  const lines = drafterAssets.map((asset, index) => {
+    const kind = String(asset?.kind || "unknown").toLowerCase();
+    const name = String(asset?.name || "unnamed");
+    const size = Number(asset?.size || 0);
+    const referencePath = String(asset?.referencePath || name);
+    const url = String(asset?.url || "");
+    const citationKeys = Array.isArray(asset?.citationKeys) ? asset.citationKeys.filter(Boolean).slice(0, 20) : [];
+    const textContent = kind === "bib" || kind === "tex" ? String(asset?.content || "") : "";
+    const snippet = textContent ? textContent.slice(0, 1800) : "";
+    const truncated = textContent.length > snippet.length;
+
+    const detailParts = [
+      `${index + 1}. name=${name}`,
+      `type=${kind}`,
+      `size=${size}`,
+      `referencePath=${referencePath}`,
+    ];
+    if (url) {
+      detailParts.push(`url=${url}`);
+    }
+    if (citationKeys.length) {
+      detailParts.push(`citationKeys=${citationKeys.join(", ")}`);
+    }
+    if (snippet) {
+      detailParts.push(`contentSnippet=${JSON.stringify(snippet)}${truncated ? " (truncated)" : ""}`);
+    }
+    return detailParts.join(" | ");
+  });
+  return lines.join("\n");
 }
 
 async function requestCompletion(messages) {
