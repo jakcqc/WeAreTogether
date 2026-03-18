@@ -5,6 +5,7 @@ description = "Local chat UI with OpenAI-style streaming endpoints for Ollama, H
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+  "anthropic>=0.42.0",
   "fastapi>=0.115.12",
   "google-genai>=1.30.0",
   "openai>=1.76.0",

@@ -20,7 +20,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from .config import DEFAULT_MODELS, get_settings
+from .config import get_model_catalog, get_settings
 from .providers import (
     ProviderError,
     complete_text,
@@ -420,18 +420,28 @@ def visible_models() -> list:
     settings = get_settings()
     has_huggingface = bool(settings.huggingface_api_key)
     has_gemini = bool(settings.gemini_api_key)
+    has_openai = bool(settings.openai_api_key)
+    has_anthropic = bool(settings.anthropic_api_key)
 
     if installed is None:
         installed = set()
 
     filtered = []
-    for model in DEFAULT_MODELS:
+    for model in get_model_catalog():
         if model.provider == "huggingface":
             if has_huggingface:
                 filtered.append(model)
             continue
         if model.provider == "gemini":
             if has_gemini:
+                filtered.append(model)
+            continue
+        if model.provider == "openai":
+            if has_openai:
+                filtered.append(model)
+            continue
+        if model.provider == "anthropic":
+            if has_anthropic:
                 filtered.append(model)
             continue
         if model.provider != "ollama":
@@ -528,6 +538,9 @@ async def api_models() -> list[ModelResponse]:
             provider=model.provider,
             description=model.description,
             remote=model.remote,
+            default_temperature=model.default_temperature,
+            default_max_tokens=model.default_max_tokens,
+            provider_options=model.provider_options,
         )
         for model in visible_models()
     ]
@@ -743,9 +756,11 @@ async def room_socket(websocket: WebSocket, room_name: str) -> None:
 
             agent_name = normalize_room_label(payload.get("agentName") or f"{username} ai", fallback=f"{username} ai")
             system_prompt = normalize_room_system_prompt(payload.get("systemPrompt"))
-            model_id = str(payload.get("modelId") or DEFAULT_MODELS[0].id)
+            default_model_id = get_model_catalog()[0].id if get_model_catalog() else "ollama:qwen2.5:7b"
+            model_id = str(payload.get("modelId") or default_model_id)
             temperature = clamp_float(payload.get("temperature"), default=0.7, minimum=0.0, maximum=2.0)
             max_tokens = clamp_int(payload.get("maxTokens"), default=512, minimum=64, maximum=4096)
+            provider_options = payload.get("providerOptions") if isinstance(payload.get("providerOptions"), dict) else {}
 
             user_message = build_room_event(
                 event_type="chat",
@@ -789,6 +804,7 @@ async def room_socket(websocket: WebSocket, room_name: str) -> None:
                         "modelId": model_id,
                         "temperature": temperature,
                         "maxTokens": max_tokens,
+                        "providerOptions": provider_options,
                         "messages": [message.model_dump() for message in ai_messages],
                     }
                 )

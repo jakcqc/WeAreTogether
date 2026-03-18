@@ -57,6 +57,7 @@ marked.setOptions({
 });
 
 let modelCatalog = [];
+let modelCatalogById = {};
 let modelCatalogSource = "unknown";
 let roomAgents = loadRoomAgents();
 let roomSettings = loadRoomSettings();
@@ -102,7 +103,7 @@ function bindEvents() {
     elements.agentNameInput,
   ].forEach((element) => element.addEventListener("change", persistRoomSettingsFromFormSafe));
 
-  elements.modelSelect.addEventListener("change", onRoomConfigInputChange);
+  elements.modelSelect.addEventListener("change", onRoomModelChange);
   elements.systemPromptInput.addEventListener("change", onRoomConfigInputChange);
   elements.temperatureInput.addEventListener("change", onRoomConfigInputChange);
   elements.maxTokensInput.addEventListener("change", onRoomConfigInputChange);
@@ -356,6 +357,11 @@ function onRoomConfigInputChange() {
   persistRoomAgents();
 }
 
+function onRoomModelChange() {
+  applyRoomModelDefaults(elements.modelSelect.value);
+  onRoomConfigInputChange();
+}
+
 function persistRoomSettings() {
   localStorage.setItem(ROOM_SETTINGS_KEY, JSON.stringify(roomSettings));
 }
@@ -369,12 +375,14 @@ async function loadModelsForRuntime() {
   try {
     const modelResult = await fetchRuntimeModels(runtimeBase);
     modelCatalog = modelResult.models;
+    modelCatalogById = Object.fromEntries(modelCatalog.map((model) => [model.id, model]));
     modelCatalogSource = modelResult.source;
     renderModelOptions(modelCatalog);
     updateStatus(roomSocket ? `Connected to #${roomSettings.roomName}` : "Disconnected");
   } catch (error) {
     modelCatalogSource = "unknown";
     modelCatalog = [{ id: roomSettings.modelId || DEFAULT_MODEL_ID, label: roomSettings.modelId || DEFAULT_MODEL_ID }];
+    modelCatalogById = Object.fromEntries(modelCatalog.map((model) => [model.id, model]));
     renderModelOptions(modelCatalog);
     appendLocalSystemMessage(`Could not load models from ${runtimeBase}: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -470,6 +478,7 @@ function sendRoomMessage() {
     modelId: roomSettings.modelId,
     temperature: roomSettings.temperature,
     maxTokens: roomSettings.maxTokens,
+    providerOptions: getRoomModelProviderOptions(roomSettings.modelId),
   }));
 
   elements.messageInput.value = "";
@@ -533,6 +542,9 @@ async function handleAiRequest(payload) {
   const runtimeModelId = mapModelIdForRuntime(modelId);
   const temperature = Number(payload.temperature ?? roomSettings.temperature ?? 0.7);
   const maxTokens = Number(payload.maxTokens ?? roomSettings.maxTokens ?? 512);
+  const providerOptions = payload.providerOptions && typeof payload.providerOptions === "object"
+    ? payload.providerOptions
+    : getRoomModelProviderOptions(modelId);
 
   if (!requestId || !sourceMessages.length) {
     roomSocket.send(JSON.stringify({
@@ -552,6 +564,7 @@ async function handleAiRequest(payload) {
       stream: false,
       temperature,
       max_tokens: maxTokens,
+      provider_options: providerOptions,
     });
 
     roomSocket.send(JSON.stringify({
@@ -844,19 +857,20 @@ function autoGrow(textarea) {
 }
 
 async function resolveClientRuntimeBase() {
-  const fallback = normalizeServerBase(roomSettings.aiRuntimeUrl || DEFAULT_AI_RUNTIME_URL);
+  const localApiBase = normalizeServerBase(window.location.origin);
+  const fallback = localApiBase;
   try {
     const response = await fetch("/api/client/runtime", { mode: "cors" });
     if (!response.ok) {
       throw new Error(`Runtime config request failed (${response.status})`);
     }
     const payload = await response.json();
-    const configured = normalizeServerBase(payload?.ollamaBaseUrl || fallback);
-    resolvedClientRuntimeBase = configured;
-    roomSettings.aiRuntimeUrl = configured;
+    const ollamaBase = normalizeServerBase(payload?.ollamaBaseUrl || DEFAULT_AI_RUNTIME_URL);
+    resolvedClientRuntimeBase = localApiBase;
+    roomSettings.aiRuntimeUrl = localApiBase;
     persistRoomSettings();
     if (elements.runtimeLabel) {
-      elements.runtimeLabel.textContent = configured;
+      elements.runtimeLabel.textContent = `${localApiBase} (OLLAMA_BASE_URL=${ollamaBase})`;
     }
   } catch {
     resolvedClientRuntimeBase = fallback;
@@ -940,6 +954,26 @@ function mapModelIdForRuntime(modelId) {
     return modelId;
   }
   return String(modelId || "").replace(/^(ollama|hf|gemini):/i, "");
+}
+
+function getRoomModelProviderOptions(modelId) {
+  const options = modelCatalogById[modelId]?.provider_options;
+  return options && typeof options === "object" ? options : {};
+}
+
+function applyRoomModelDefaults(modelId) {
+  const model = modelCatalogById[modelId];
+  if (!model) {
+    return;
+  }
+  if (typeof model.default_temperature === "number") {
+    roomSettings.temperature = model.default_temperature;
+    elements.temperatureInput.value = model.default_temperature;
+  }
+  if (typeof model.default_max_tokens === "number") {
+    roomSettings.maxTokens = model.default_max_tokens;
+    elements.maxTokensInput.value = model.default_max_tokens;
+  }
 }
 
 function buildSocketUrl(serverBase, roomName, displayName) {

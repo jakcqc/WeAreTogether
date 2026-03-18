@@ -6,11 +6,15 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import AsyncIterator, Callable, Iterable
 
+try:
+    from anthropic import AsyncAnthropic
+except Exception:  # pragma: no cover - optional dependency fallback
+    AsyncAnthropic = None  # type: ignore[assignment]
 from google import genai
 from google.genai import types
 from openai import AsyncOpenAI
 
-from .config import MODEL_MAP, ModelDefinition, get_settings
+from .config import ModelDefinition, get_model_map, get_settings
 from .schemas import ChatCompletionRequest, ChatMessage
 
 
@@ -29,11 +33,18 @@ class ResolvedModel:
 
 
 def resolve_model(model_id: str) -> ResolvedModel:
-    if model_id in MODEL_MAP:
-        model = MODEL_MAP[model_id]
+    model_map = get_model_map()
+    if model_id in model_map:
+        model = model_map[model_id]
         return _to_resolved(model)
 
-    for prefix, provider in (("ollama:", "ollama"), ("hf:", "huggingface"), ("gemini:", "gemini")):
+    for prefix, provider in (
+        ("ollama:", "ollama"),
+        ("hf:", "huggingface"),
+        ("gemini:", "gemini"),
+        ("openai:", "openai"),
+        ("anthropic:", "anthropic"),
+    ):
         if model_id.startswith(prefix):
             upstream_model = model_id[len(prefix) :]
             return ResolvedModel(
@@ -45,7 +56,7 @@ def resolve_model(model_id: str) -> ResolvedModel:
                 remote=provider != "ollama",
             )
 
-    available = ", ".join(MODEL_MAP.keys())
+    available = ", ".join(model_map.keys())
     raise ProviderError(f"Unknown model '{model_id}'. Use one of: {available}")
 
 
@@ -77,6 +88,10 @@ def gemini_contents(messages: list[ChatMessage]) -> tuple[str | None, list[types
     return ("\n\n".join(system_messages) or None, contents)
 
 
+def provider_options(request: ChatCompletionRequest) -> dict:
+    return request.provider_options if isinstance(request.provider_options, dict) else {}
+
+
 def _openai_base_url_for_ollama() -> str:
     base_url = get_settings().ollama_base_url
     return base_url if base_url.endswith("/v1") else f"{base_url}/v1"
@@ -97,9 +112,29 @@ def _huggingface_client() -> AsyncOpenAI:
 
 
 @lru_cache(maxsize=1)
+def _openai_client() -> AsyncOpenAI:
+    settings = get_settings()
+    return AsyncOpenAI(
+        base_url=settings.openai_base_url,
+        api_key=settings.openai_api_key or "missing",
+    )
+
+
+@lru_cache(maxsize=1)
 def _gemini_client() -> genai.Client:
     settings = get_settings()
     return genai.Client(api_key=settings.gemini_api_key)
+
+
+@lru_cache(maxsize=1)
+def _anthropic_client() -> AsyncAnthropic:
+    if AsyncAnthropic is None:
+        raise ProviderError("Anthropic support requires the 'anthropic' package. Run dependency sync/install.")
+    settings = get_settings()
+    return AsyncAnthropic(
+        api_key=settings.anthropic_api_key or "missing",
+        base_url=settings.anthropic_base_url,
+    )
 
 
 def _require_provider_key(provider: str) -> None:
@@ -108,10 +143,14 @@ def _require_provider_key(provider: str) -> None:
         raise ProviderError("HUGGINGFACE_API_KEY is missing in .env")
     if provider == "gemini" and not settings.gemini_api_key:
         raise ProviderError("GEMINI_API_KEY is missing in .env")
+    if provider == "openai" and not settings.openai_api_key:
+        raise ProviderError("OPENAI_API_KEY is missing in .env")
+    if provider == "anthropic" and not settings.anthropic_api_key:
+        raise ProviderError("ANTHROPIC_API_KEY is missing in .env")
 
 
 async def stream_text(request: ChatCompletionRequest, resolved: ResolvedModel) -> AsyncIterator[str]:
-    if resolved.provider in {"ollama", "huggingface"}:
+    if resolved.provider in {"ollama", "huggingface", "openai"}:
         async for chunk in _stream_openai_compatible(request, resolved):
             yield chunk
         return
@@ -121,14 +160,21 @@ async def stream_text(request: ChatCompletionRequest, resolved: ResolvedModel) -
             yield chunk
         return
 
+    if resolved.provider == "anthropic":
+        async for chunk in _stream_anthropic(request, resolved):
+            yield chunk
+        return
+
     raise ProviderError(f"Unsupported provider '{resolved.provider}'")
 
 
 async def complete_text(request: ChatCompletionRequest, resolved: ResolvedModel) -> str:
-    if resolved.provider in {"ollama", "huggingface"}:
+    if resolved.provider in {"ollama", "huggingface", "openai"}:
         return await _complete_openai_compatible(request, resolved)
     if resolved.provider == "gemini":
         return await _complete_gemini(request, resolved)
+    if resolved.provider == "anthropic":
+        return await _complete_anthropic(request, resolved)
     raise ProviderError(f"Unsupported provider '{resolved.provider}'")
 
 
@@ -137,14 +183,22 @@ async def _stream_openai_compatible(
 ) -> AsyncIterator[str]:
     if resolved.provider == "huggingface":
         _require_provider_key("huggingface")
+    if resolved.provider == "openai":
+        _require_provider_key("openai")
 
-    client = _ollama_client() if resolved.provider == "ollama" else _huggingface_client()
+    if resolved.provider == "ollama":
+        client = _ollama_client()
+    elif resolved.provider == "huggingface":
+        client = _huggingface_client()
+    else:
+        client = _openai_client()
     try:
         stream = await client.chat.completions.create(
             model=resolved.upstream_model,
             messages=openai_style_messages(request.messages),
             temperature=request.temperature,
             max_tokens=request.max_tokens,
+            extra_body=provider_options(request) or None,
             stream=True,
         )
         async for chunk in stream:
@@ -171,14 +225,22 @@ async def _complete_openai_compatible(
 ) -> str:
     if resolved.provider == "huggingface":
         _require_provider_key("huggingface")
+    if resolved.provider == "openai":
+        _require_provider_key("openai")
 
-    client = _ollama_client() if resolved.provider == "ollama" else _huggingface_client()
+    if resolved.provider == "ollama":
+        client = _ollama_client()
+    elif resolved.provider == "huggingface":
+        client = _huggingface_client()
+    else:
+        client = _openai_client()
     try:
         response = await client.chat.completions.create(
             model=resolved.upstream_model,
             messages=openai_style_messages(request.messages),
             temperature=request.temperature,
             max_tokens=request.max_tokens,
+            extra_body=provider_options(request) or None,
             stream=False,
         )
         content = response.choices[0].message.content or ""
@@ -194,10 +256,13 @@ async def _complete_openai_compatible(
 async def _stream_gemini(request: ChatCompletionRequest, resolved: ResolvedModel) -> AsyncIterator[str]:
     _require_provider_key("gemini")
     system_instruction, contents = gemini_contents(request.messages)
+    options = provider_options(request)
     config = types.GenerateContentConfig(
         system_instruction=system_instruction,
         temperature=request.temperature,
         max_output_tokens=request.max_tokens,
+        top_k=options.get("top_k"),
+        top_p=options.get("top_p"),
     )
 
     def factory() -> Iterable[str]:
@@ -217,10 +282,13 @@ async def _stream_gemini(request: ChatCompletionRequest, resolved: ResolvedModel
 async def _complete_gemini(request: ChatCompletionRequest, resolved: ResolvedModel) -> str:
     _require_provider_key("gemini")
     system_instruction, contents = gemini_contents(request.messages)
+    options = provider_options(request)
     config = types.GenerateContentConfig(
         system_instruction=system_instruction,
         temperature=request.temperature,
         max_output_tokens=request.max_tokens,
+        top_k=options.get("top_k"),
+        top_p=options.get("top_p"),
     )
 
     def run_completion() -> str:
@@ -232,6 +300,43 @@ async def _complete_gemini(request: ChatCompletionRequest, resolved: ResolvedMod
         return response.text or ""
 
     return await asyncio.to_thread(run_completion)
+
+
+def anthropic_messages(messages: list[ChatMessage]) -> tuple[str | None, list[dict[str, str]]]:
+    system_messages = [message.content for message in messages if message.role == "system"]
+    contents = [
+        {"role": "assistant" if message.role == "assistant" else "user", "content": message.content}
+        for message in messages
+        if message.role != "system"
+    ]
+    return ("\n\n".join(system_messages) or None, contents)
+
+
+async def _stream_anthropic(request: ChatCompletionRequest, resolved: ResolvedModel) -> AsyncIterator[str]:
+    # Keep streaming shape simple and reliable by yielding a complete response chunk.
+    text = await _complete_anthropic(request, resolved)
+    if text:
+        yield text
+
+
+async def _complete_anthropic(request: ChatCompletionRequest, resolved: ResolvedModel) -> str:
+    _require_provider_key("anthropic")
+    system_instruction, messages = anthropic_messages(request.messages)
+    options = provider_options(request)
+    try:
+        response = await _anthropic_client().messages.create(
+            model=resolved.upstream_model,
+            system=system_instruction if system_instruction is not None else "",
+            messages=messages,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens or 1024,
+            top_k=options.get("top_k"),
+            top_p=options.get("top_p"),
+        )
+        text_parts = [block.text for block in response.content if getattr(block, "type", "") == "text"]
+        return "".join(text_parts).strip()
+    except Exception as exc:  # pragma: no cover - network/provider failure path
+        raise ProviderError(str(exc)) from exc
 
 
 async def _iterate_blocking_stream(factory: Callable[[], Iterable[str]]) -> AsyncIterator[str]:

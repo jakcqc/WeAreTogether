@@ -58,6 +58,7 @@ marked.setOptions({
 });
 
 let modelCatalog = [];
+let modelCatalogById = {};
 let sessions = loadSessions();
 let settings = loadSettings();
 let agents = loadAgents();
@@ -112,7 +113,7 @@ function bindEvents() {
   elements.temperatureInput.addEventListener("change", onConfigInputChange);
   elements.maxTokensInput.addEventListener("change", onConfigInputChange);
   elements.systemPrompt.addEventListener("change", onConfigInputChange);
-  elements.modelSelect.addEventListener("change", onConfigInputChange);
+  elements.modelSelect.addEventListener("change", onModelChange);
   window.addEventListener("resize", renderEdgeAds);
 }
 
@@ -202,8 +203,10 @@ function pickRandomAds(pool, count) {
 }
 
 async function loadModels() {
+  const hadModelSelection = Boolean(settings.modelId);
   const response = await fetch("/api/models");
   modelCatalog = await response.json();
+  modelCatalogById = Object.fromEntries(modelCatalog.map((model) => [model.id, model]));
   elements.modelSelect.innerHTML = "";
   modelCatalog.forEach((model) => {
     const option = document.createElement("option");
@@ -215,7 +218,15 @@ async function loadModels() {
   const currentModel = settings.modelId || modelCatalog[0]?.id;
   elements.modelSelect.value = modelCatalog.some((model) => model.id === currentModel) ? currentModel : modelCatalog[0]?.id;
   settings.modelId = elements.modelSelect.value;
+  if (!hadModelSelection) {
+    applyModelDefaults(settings.modelId);
+  }
   persistSettings();
+}
+
+function onModelChange() {
+  applyModelDefaults(elements.modelSelect.value);
+  onConfigInputChange();
 }
 
 function onConfigInputChange() {
@@ -818,6 +829,7 @@ async function streamAssistantReply(session, modelId) {
         stream: true,
         temperature: settings.temperature,
         max_tokens: settings.maxTokens,
+        provider_options: getModelProviderOptions(modelId),
         messages: outboundMessages,
       }),
       signal: activeAbortController.signal,
@@ -887,6 +899,26 @@ async function streamAssistantReply(session, modelId) {
     elements.sendButton.disabled = false;
     elements.stopButton.disabled = true;
     refreshMessageActionStates();
+  }
+}
+
+function getModelProviderOptions(modelId) {
+  const options = modelCatalogById[modelId]?.provider_options;
+  return options && typeof options === "object" ? options : {};
+}
+
+function applyModelDefaults(modelId) {
+  const model = modelCatalogById[modelId];
+  if (!model) {
+    return;
+  }
+  if (typeof model.default_temperature === "number") {
+    settings.temperature = model.default_temperature;
+    elements.temperatureInput.value = model.default_temperature;
+  }
+  if (typeof model.default_max_tokens === "number") {
+    settings.maxTokens = model.default_max_tokens;
+    elements.maxTokensInput.value = model.default_max_tokens;
   }
 }
 

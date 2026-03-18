@@ -1,0 +1,30 @@
+[
+  {
+    "id": "gemini:gemini-3.1-pro-preview",
+    "label": "Gemini 3.1 Pro Preview",
+    "provider": "gemini",
+    "upstream_model": "gemini-3.1-pro-preview",
+    "description": "Latest high-capability Gemini model.",
+    "remote": true,
+    "default_temperature": 0.3,
+    "default_max_tokens": 1800,
+    "provider_options": {
+      "top_k": 40,
+      "top_p": 0.95
+    }
+  },
+  {
+    "id": "gemini:gemini-3.1-flash-lite-preview",
+    "label": "Gemini 3.1 Flash-Lite Preview",
+    "provider": "gemini",
+    "upstream_model": "gemini-3.1-flash-lite-preview",
+    "description": "Fast, smaller Gemini model for high-throughput tasks.",
+    "remote": true,
+    "default_temperature": 0.4,
+    "default_max_tokens": 1200,
+    "provider_options": {
+      "top_k": 32,
+      "top_p": 0.95
+    }
+  }
+]

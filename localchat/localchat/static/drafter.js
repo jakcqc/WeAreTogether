@@ -143,6 +143,7 @@ const elements = {
 };
 let latexEditor = initializeLatexEditor();
 let modelCatalog = [];
+let modelCatalogById = {};
 let drafterAgents = loadAgents();
 let drafterSettings = loadSettings();
 let snapshots = loadSnapshots();
@@ -193,7 +194,7 @@ function bindEvents() {
   elements.assetUploadButton.addEventListener("click", () => void openAssetPicker());
   elements.assetUploadInput.addEventListener("change", () => void handleAssetUpload());
   elements.assetRefreshButton.addEventListener("click", () => void loadAssets());
-  elements.modelSelect.addEventListener("change", onConfigChange);
+  elements.modelSelect.addEventListener("change", onModelChange);
   elements.temperatureInput.addEventListener("change", onConfigChange);
   elements.maxTokensInput.addEventListener("change", onConfigChange);
   elements.systemPrompt.addEventListener("change", onConfigChange);
@@ -284,8 +285,10 @@ async function loadModelsForServer(serverBase = drafterSettings.serverUrl, optio
       throw new Error(`Model list request failed (${response.status})`);
     }
     modelCatalog = await response.json();
+    modelCatalogById = Object.fromEntries(modelCatalog.map((model) => [model.id, model]));
   } catch {
     modelCatalog = [{ id: DEFAULT_MODEL_ID, label: DEFAULT_MODEL_ID }];
+    modelCatalogById = Object.fromEntries(modelCatalog.map((model) => [model.id, model]));
   }
   loadedModelServerBase = normalizedServerBase;
   elements.modelSelect.innerHTML = "";
@@ -299,6 +302,11 @@ async function loadModelsForServer(serverBase = drafterSettings.serverUrl, optio
   drafterSettings.modelId = nextValue;
   elements.modelSelect.value = nextValue;
   persistSettings();
+}
+
+function onModelChange() {
+  applyModelDefaults(elements.modelSelect.value);
+  onConfigChange();
 }
 
 function loadSettings() {
@@ -1194,6 +1202,7 @@ async function requestCompletion(messages) {
       stream: false,
       temperature: drafterSettings.temperature,
       max_tokens: drafterSettings.maxTokens,
+      provider_options: getModelProviderOptions(drafterSettings.modelId),
       messages,
     }),
   });
@@ -1202,6 +1211,26 @@ async function requestCompletion(messages) {
     throw new Error(payload.detail || "Request failed");
   }
   return payload?.choices?.[0]?.message?.content?.trim() || "";
+}
+
+function getModelProviderOptions(modelId) {
+  const options = modelCatalogById[modelId]?.provider_options;
+  return options && typeof options === "object" ? options : {};
+}
+
+function applyModelDefaults(modelId) {
+  const model = modelCatalogById[modelId];
+  if (!model) {
+    return;
+  }
+  if (typeof model.default_temperature === "number") {
+    drafterSettings.temperature = model.default_temperature;
+    elements.temperatureInput.value = model.default_temperature;
+  }
+  if (typeof model.default_max_tokens === "number") {
+    drafterSettings.maxTokens = model.default_max_tokens;
+    elements.maxTokensInput.value = model.default_max_tokens;
+  }
 }
 
 function handleAskResponse(text) {
