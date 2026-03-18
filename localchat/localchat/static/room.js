@@ -2,6 +2,8 @@ const ROOM_SETTINGS_KEY = "localchat.roomSettings.v2";
 const ROOM_AGENTS_KEY = "localchat.roomAgents.v1";
 const DEFAULT_AGENT_ID = "custom";
 const DEFAULT_MODEL_ID = "ollama:qwen2.5:7b";
+const DEFAULT_AI_RUNTIME_URL = "http://127.0.0.1:11434";
+const QUICK_REACTION_EMOJIS = ["👍", "❤️", "😂", "🔥", "🎉"];
 const EDGE_ADS = {
   horizontal: [
     { src: "/assets/dataset-ads/superfine-train-hero.jpg" },
@@ -30,6 +32,7 @@ const elements = {
   edgeAdRight: document.querySelector("#edge-ad-right"),
   edgeAdTop: document.querySelector("#edge-ad-top"),
   emptyState: document.querySelector("#room-empty-state"),
+  focusButton: document.querySelector("#focus-room-button"),
   maxTokensInput: document.querySelector("#room-max-tokens-input"),
   messageInput: document.querySelector("#room-message-input"),
   messages: document.querySelector("#room-messages"),
@@ -39,6 +42,7 @@ const elements = {
   profileName: document.querySelector("#room-profile-name"),
   profileStatus: document.querySelector("#room-profile-status"),
   roomInput: document.querySelector("#room-name-input"),
+  runtimeLabel: document.querySelector("#room-runtime-label"),
   saveAgentButton: document.querySelector("#save-room-agent-button"),
   sendButton: document.querySelector("#send-room-button"),
   serverInput: document.querySelector("#server-url-input"),
@@ -53,10 +57,13 @@ marked.setOptions({
 });
 
 let modelCatalog = [];
+let modelCatalogSource = "unknown";
 let roomAgents = loadRoomAgents();
 let roomSettings = loadRoomSettings();
 let roomSocket = null;
-const localModelServerBase = normalizeServerBase(window.location.origin);
+let resolvedClientRuntimeBase = "";
+let canDeleteMessages = false;
+let roomFocusMode = false;
 
 applyRoomSettingsToForm();
 renderEdgeAds();
@@ -65,16 +72,20 @@ applySelectedRoomAgent();
 updateRoomMeta();
 updateRoomEmptyState();
 autoGrow(elements.messageInput);
-await loadModelsForServer();
+await resolveClientRuntimeBase();
+await loadModelsForRuntime();
 bindEvents();
+applySharedFocusMode(roomFocusMode);
 
 function bindEvents() {
   elements.connectButton.addEventListener("click", () => connectToRoom());
   elements.disconnectButton.addEventListener("click", () => disconnectFromRoom());
   elements.sendButton.addEventListener("click", () => sendRoomMessage());
+  elements.focusButton?.addEventListener("click", () => toggleSharedFocusMode());
   elements.saveAgentButton.addEventListener("click", saveRoomAgent);
   elements.deleteAgentButton.addEventListener("click", deleteRoomAgent);
   elements.agentSelect.addEventListener("change", onRoomAgentChange);
+  elements.messages.addEventListener("click", onRoomMessageActionClick);
 
   elements.messageInput.addEventListener("input", () => autoGrow(elements.messageInput));
   elements.messageInput.addEventListener("keydown", (event) => {
@@ -171,6 +182,7 @@ function persistRoomSettingsFromForm() {
     serverUrl: normalizeServerBase(elements.serverInput.value),
     roomName: normalizeRoomName(elements.roomInput.value),
     displayName: normalizeRoomName(elements.displayNameInput.value, "guest"),
+    aiRuntimeUrl: normalizeServerBase(resolvedClientRuntimeBase || roomSettings.aiRuntimeUrl || DEFAULT_AI_RUNTIME_URL),
     agentId: elements.agentSelect.value || DEFAULT_AGENT_ID,
     agentName: normalizeAgentName(elements.agentNameInput.value),
     systemPrompt: elements.systemPromptInput.value.trim(),
@@ -194,6 +206,7 @@ function loadRoomSettings() {
     serverUrl,
     roomName: normalizeRoomName(parsed?.roomName || "lobby"),
     displayName: normalizeRoomName(parsed?.displayName || "guest", "guest"),
+    aiRuntimeUrl: normalizeServerBase(parsed?.aiRuntimeUrl || DEFAULT_AI_RUNTIME_URL),
     agentId: parsed?.agentId ?? DEFAULT_AGENT_ID,
     agentName: normalizeAgentName(parsed?.agentName || "Room AI"),
     systemPrompt: typeof parsed?.systemPrompt === "string" ? parsed.systemPrompt : "",
@@ -347,22 +360,23 @@ function persistRoomSettings() {
   localStorage.setItem(ROOM_SETTINGS_KEY, JSON.stringify(roomSettings));
 }
 
-async function loadModelsForServer() {
+async function loadModelsForRuntime() {
   persistRoomSettingsFromForm();
+  const runtimeBase = normalizeServerBase(resolvedClientRuntimeBase || roomSettings.aiRuntimeUrl || DEFAULT_AI_RUNTIME_URL);
+  roomSettings.aiRuntimeUrl = runtimeBase;
+  persistRoomSettings();
 
   try {
-    const response = await fetch(`${localModelServerBase}/api/models`, { mode: "cors" });
-    if (!response.ok) {
-      throw new Error(`Model list request failed (${response.status})`);
-    }
-
-    modelCatalog = await response.json();
+    const modelResult = await fetchRuntimeModels(runtimeBase);
+    modelCatalog = modelResult.models;
+    modelCatalogSource = modelResult.source;
     renderModelOptions(modelCatalog);
     updateStatus(roomSocket ? `Connected to #${roomSettings.roomName}` : "Disconnected");
   } catch (error) {
+    modelCatalogSource = "unknown";
     modelCatalog = [{ id: roomSettings.modelId || DEFAULT_MODEL_ID, label: roomSettings.modelId || DEFAULT_MODEL_ID }];
     renderModelOptions(modelCatalog);
-    appendLocalSystemMessage(`Could not load local models from ${localModelServerBase}: ${error instanceof Error ? error.message : String(error)}`);
+    appendLocalSystemMessage(`Could not load models from ${runtimeBase}: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -397,7 +411,7 @@ async function connectToRoom() {
     return;
   }
 
-  await loadModelsForServer();
+  await loadModelsForRuntime();
 
   const socketUrl = buildSocketUrl(roomSettings.serverUrl, roomSettings.roomName, roomSettings.displayName);
   updateStatus("Connecting");
@@ -408,6 +422,9 @@ async function connectToRoom() {
     elements.sendButton.disabled = false;
     elements.disconnectButton.disabled = false;
     elements.connectButton.disabled = true;
+    if (elements.focusButton) {
+      elements.focusButton.disabled = false;
+    }
     appendLocalSystemMessage(`Connected to ${socketUrl}`);
   });
 
@@ -417,6 +434,9 @@ async function connectToRoom() {
     elements.sendButton.disabled = true;
     elements.disconnectButton.disabled = true;
     elements.connectButton.disabled = false;
+    if (elements.focusButton) {
+      elements.focusButton.disabled = true;
+    }
     if (event.reason) {
       appendLocalSystemMessage(`Disconnected: ${event.reason}`);
     }
@@ -463,15 +483,93 @@ function handleSocketMessage(rawPayload) {
     return;
   }
 
+  if (payload.type === "ai_request") {
+    void handleAiRequest(payload);
+    return;
+  }
+
   if (payload.type === "history") {
     elements.messages.innerHTML = "";
+    canDeleteMessages = Boolean(payload.canDeleteMessages);
+    applySharedFocusMode(Boolean(payload.focusMode));
     payload.messages.forEach((message) => appendRoomMessage(message));
     updateRoomEmptyState();
     scrollMessagesToBottom();
     return;
   }
 
+  if (payload.type === "reaction_update") {
+    applyMessageReactions(payload.messageId, payload.reactions);
+    return;
+  }
+
+  if (payload.type === "message_deleted") {
+    removeMessageFromRoom(payload.messageId);
+    return;
+  }
+
+  if (payload.type === "focus_mode") {
+    applySharedFocusMode(Boolean(payload.enabled));
+    return;
+  }
+
+  if (payload.type === "error") {
+    appendLocalSystemMessage(payload.detail || "Room action failed.");
+    return;
+  }
+
   appendRoomMessage(payload);
+}
+
+async function handleAiRequest(payload) {
+  if (!roomSocket || roomSocket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+
+  const requestId = String(payload.requestId || "");
+  const sourceMessages = Array.isArray(payload.messages) ? payload.messages : [];
+  const runtimeBase = normalizeServerBase(resolvedClientRuntimeBase || roomSettings.aiRuntimeUrl || DEFAULT_AI_RUNTIME_URL);
+  const modelId = String(payload.modelId || roomSettings.modelId || DEFAULT_MODEL_ID);
+  const runtimeModelId = mapModelIdForRuntime(modelId);
+  const temperature = Number(payload.temperature ?? roomSettings.temperature ?? 0.7);
+  const maxTokens = Number(payload.maxTokens ?? roomSettings.maxTokens ?? 512);
+
+  if (!requestId || !sourceMessages.length) {
+    roomSocket.send(JSON.stringify({
+      type: "ai_result",
+      requestId,
+      modelId,
+      agentName: payload.agentName || roomSettings.agentName,
+      error: "Invalid AI request payload.",
+    }));
+    return;
+  }
+
+  try {
+    const completion = await fetchLocalCompletion(runtimeBase, {
+      model: runtimeModelId,
+      messages: sourceMessages,
+      stream: false,
+      temperature,
+      max_tokens: maxTokens,
+    });
+
+    roomSocket.send(JSON.stringify({
+      type: "ai_result",
+      requestId,
+      modelId,
+      agentName: payload.agentName || roomSettings.agentName,
+      content: completion,
+    }));
+  } catch (error) {
+    roomSocket.send(JSON.stringify({
+      type: "ai_result",
+      requestId,
+      modelId,
+      agentName: payload.agentName || roomSettings.agentName,
+      error: error instanceof Error ? error.message : String(error),
+    }));
+  }
 }
 
 function appendRoomMessage(message) {
@@ -492,10 +590,154 @@ function appendRoomMessage(message) {
   content.innerHTML = DOMPurify.sanitize(rendered);
   enhanceRenderedMessage(content, message.content || "");
 
-  article.append(meta, content);
+  const reactions = document.createElement("div");
+  reactions.className = "message-reactions";
+
+  const actions = document.createElement("div");
+  actions.className = "message-actions";
+  actions.dataset.messageId = article.dataset.messageId;
+
+  if (message.speakerType !== "system") {
+    const likeButton = document.createElement("button");
+    likeButton.type = "button";
+    likeButton.className = "secondary-button message-like-button";
+    likeButton.dataset.action = "react";
+    likeButton.dataset.emoji = "👍";
+    likeButton.textContent = "Like 👍";
+    actions.append(likeButton);
+
+    QUICK_REACTION_EMOJIS.filter((emoji) => emoji !== "👍").forEach((emoji) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "icon-button message-action-button";
+      button.dataset.action = "react";
+      button.dataset.emoji = emoji;
+      button.textContent = emoji;
+      actions.append(button);
+    });
+
+    const customEmojiButton = document.createElement("button");
+    customEmojiButton.type = "button";
+    customEmojiButton.className = "icon-button message-action-button";
+    customEmojiButton.dataset.action = "react_custom";
+    customEmojiButton.textContent = "+";
+    actions.append(customEmojiButton);
+
+    if (canDeleteMessages) {
+      const deleteButton = document.createElement("button");
+      deleteButton.type = "button";
+      deleteButton.className = "secondary-button message-delete-button";
+      deleteButton.dataset.action = "delete";
+      deleteButton.textContent = "Delete";
+      actions.append(deleteButton);
+    }
+  }
+
+  article.append(meta, content, reactions, actions);
+  renderMessageReactions(article, message.reactions || {});
   elements.messages.append(article);
   updateRoomEmptyState();
   scrollMessagesToBottom();
+}
+
+function onRoomMessageActionClick(event) {
+  const button = event.target.closest("button[data-action]");
+  if (!button || !roomSocket || roomSocket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+
+  const action = button.dataset.action;
+  const actionsRow = button.closest(".message-actions");
+  const messageId = actionsRow?.dataset.messageId;
+  if (!messageId) {
+    return;
+  }
+
+  if (action === "react") {
+    const emoji = button.dataset.emoji;
+    if (!emoji) {
+      return;
+    }
+    roomSocket.send(JSON.stringify({
+      type: "reaction_toggle",
+      messageId,
+      emoji,
+    }));
+    return;
+  }
+
+  if (action === "react_custom") {
+    const emoji = (window.prompt("Emoji reaction", "") || "").trim();
+    if (!emoji) {
+      return;
+    }
+    roomSocket.send(JSON.stringify({
+      type: "reaction_toggle",
+      messageId,
+      emoji,
+    }));
+    return;
+  }
+
+  if (action === "delete" && canDeleteMessages) {
+    roomSocket.send(JSON.stringify({
+      type: "delete_message",
+      messageId,
+    }));
+  }
+}
+
+function applyMessageReactions(messageId, reactions) {
+  const article = findMessageArticle(messageId);
+  if (!article) {
+    return;
+  }
+  renderMessageReactions(article, reactions || {});
+}
+
+function removeMessageFromRoom(messageId) {
+  const article = findMessageArticle(messageId);
+  if (!article) {
+    return;
+  }
+  article.remove();
+  updateRoomEmptyState();
+}
+
+function findMessageArticle(messageId) {
+  if (!messageId) {
+    return null;
+  }
+  return elements.messages.querySelector(`[data-message-id="${CSS.escape(String(messageId))}"]`);
+}
+
+function renderMessageReactions(article, reactions) {
+  const container = article.querySelector(".message-reactions");
+  if (!container) {
+    return;
+  }
+
+  container.innerHTML = "";
+  const entries = Object.entries(reactions || {})
+    .map(([emoji, value]) => ({
+      emoji,
+      count: Number(value?.count ?? 0),
+    }))
+    .filter((item) => item.emoji && item.count > 0)
+    .sort((left, right) => right.count - left.count || left.emoji.localeCompare(right.emoji));
+
+  if (!entries.length) {
+    container.style.display = "none";
+    return;
+  }
+
+  container.style.display = "flex";
+  entries.forEach((entry) => {
+    const chip = document.createElement("span");
+    chip.className = "reaction-chip";
+    chip.textContent = `${entry.emoji} ${entry.count}`;
+    container.append(chip);
+  });
 }
 
 function getRoomLabel(message) {
@@ -562,6 +804,24 @@ function updateStatus(value) {
   elements.profileStatus.textContent = value === "Disconnected" ? "OFFLINE" : value.toUpperCase();
 }
 
+function applySharedFocusMode(enabled) {
+  roomFocusMode = Boolean(enabled);
+  document.body.classList.toggle("focus-mode", roomFocusMode);
+  if (elements.focusButton) {
+    elements.focusButton.textContent = roomFocusMode ? "Focus Mode: On" : "Focus Mode: Off";
+  }
+}
+
+function toggleSharedFocusMode() {
+  if (!roomSocket || roomSocket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  roomSocket.send(JSON.stringify({
+    type: "focus_mode",
+    enabled: !roomFocusMode,
+  }));
+}
+
 function updateRoomMeta() {
   elements.profileHandle.textContent = roomSettings.displayName;
   elements.profileName.textContent = roomSettings.roomName;
@@ -581,6 +841,105 @@ function scrollMessagesToBottom() {
 function autoGrow(textarea) {
   textarea.style.height = "auto";
   textarea.style.height = `${textarea.scrollHeight}px`;
+}
+
+async function resolveClientRuntimeBase() {
+  const fallback = normalizeServerBase(roomSettings.aiRuntimeUrl || DEFAULT_AI_RUNTIME_URL);
+  try {
+    const response = await fetch("/api/client/runtime", { mode: "cors" });
+    if (!response.ok) {
+      throw new Error(`Runtime config request failed (${response.status})`);
+    }
+    const payload = await response.json();
+    const configured = normalizeServerBase(payload?.ollamaBaseUrl || fallback);
+    resolvedClientRuntimeBase = configured;
+    roomSettings.aiRuntimeUrl = configured;
+    persistRoomSettings();
+    if (elements.runtimeLabel) {
+      elements.runtimeLabel.textContent = configured;
+    }
+  } catch {
+    resolvedClientRuntimeBase = fallback;
+    if (elements.runtimeLabel) {
+      elements.runtimeLabel.textContent = fallback;
+    }
+  }
+}
+
+async function fetchRuntimeModels(runtimeBase) {
+  const localChatResponse = await fetch(`${runtimeBase}/api/models`, { mode: "cors" }).catch(() => null);
+  if (localChatResponse?.ok) {
+    const payload = await localChatResponse.json();
+    if (Array.isArray(payload) && payload.length > 0) {
+      return { source: "localchat", models: payload };
+    }
+  }
+
+  const openAiResponse = await fetch(`${runtimeBase}/v1/models`, { mode: "cors" }).catch(() => null);
+  if (openAiResponse?.ok) {
+    const payload = await openAiResponse.json();
+    const data = Array.isArray(payload?.data) ? payload.data : [];
+    const models = data
+      .map((item) => ({ id: String(item?.id || "").trim(), label: String(item?.id || "").trim() }))
+      .filter((item) => item.id);
+    if (models.length > 0) {
+      return { source: "openai", models };
+    }
+  }
+
+  const ollamaResponse = await fetch(`${runtimeBase}/api/tags`, { mode: "cors" }).catch(() => null);
+  if (ollamaResponse?.ok) {
+    const payload = await ollamaResponse.json();
+    const tags = Array.isArray(payload?.models) ? payload.models : [];
+    const models = tags
+      .map((item) => String(item?.name || item?.model || "").trim())
+      .filter(Boolean)
+      .map((id) => ({ id, label: id }));
+    if (models.length > 0) {
+      return { source: "ollama", models };
+    }
+  }
+
+  throw new Error("No models endpoint responded. Expected /api/models, /v1/models, or /api/tags.");
+}
+
+async function fetchLocalCompletion(runtimeBase, body) {
+  const response = await fetch(`${runtimeBase}/v1/chat/completions`, {
+    method: "POST",
+    mode: "cors",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    let detail = response.statusText;
+    try {
+      const payload = await response.json();
+      detail = payload?.error?.message || payload?.detail || detail;
+    } catch {
+      detail = await response.text();
+    }
+    throw new Error(`Completion request failed (${response.status}): ${detail}`);
+  }
+
+  const payload = await response.json();
+  const content = payload?.choices?.[0]?.message?.content;
+  if (typeof content === "string") {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return content.map((part) => String(part?.text || "")).join("");
+  }
+  return String(content || "");
+}
+
+function mapModelIdForRuntime(modelId) {
+  if (modelCatalogSource === "localchat") {
+    return modelId;
+  }
+  return String(modelId || "").replace(/^(ollama|hf|gemini):/i, "");
 }
 
 function buildSocketUrl(serverBase, roomName, displayName) {

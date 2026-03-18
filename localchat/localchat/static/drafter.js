@@ -94,6 +94,9 @@ const elements = {
   askModeButton: document.querySelector("#ask-mode-button"),
   collaboratorCount: document.querySelector("#collaborator-count"),
   collaboratorList: document.querySelector("#collaborator-list"),
+  collabChatMessages: document.querySelector("#drafter-collab-chat-messages"),
+  collabChatInput: document.querySelector("#drafter-collab-chat-input"),
+  collabChatSend: document.querySelector("#drafter-collab-chat-send"),
   compileLog: document.querySelector("#compile-log"),
   compileStatusLabel: document.querySelector("#compile-status-label"),
   connectButton: document.querySelector("#connect-drafter-button"),
@@ -149,6 +152,7 @@ let currentMode = drafterSettings.mode || "ask";
 let pendingDiffTarget = "";
 let draftSocket = null;
 let syncTimer = null;
+let draftChatMessages = [];
 let remoteApplyInProgress = false;
 let suppressEditorEvents = false;
 let loadedModelServerBase = "";
@@ -167,6 +171,7 @@ updateEditorStats();
 renderPreview();
 renderCompileLog();
 renderCollaborators([]);
+renderDraftChat([]);
 bindEvents();
 updateModeUi();
 updateAgentPanelUi();
@@ -201,6 +206,13 @@ function bindEvents() {
   });
   elements.connectButton.addEventListener("click", () => void connectToDraft({ forceReconnect: true }));
   elements.disconnectButton.addEventListener("click", disconnectFromDraft);
+  elements.collabChatSend.addEventListener("click", sendDraftChatMessage);
+  elements.collabChatInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      sendDraftChatMessage();
+    }
+  });
   elements.askModeButton.addEventListener("click", () => setMode("ask"));
   elements.agentModeButton.addEventListener("click", () => setMode("agent"));
   elements.runButton.addEventListener("click", () => void runAi());
@@ -1361,6 +1373,8 @@ async function connectToDraft(options = {}) {
     updateConnectionState(`Connected to #${drafterSettings.roomName}`);
     elements.connectButton.disabled = true;
     elements.disconnectButton.disabled = false;
+    elements.collabChatSend.disabled = false;
+    elements.collabChatInput.disabled = false;
     sendPresence("viewing");
   });
   socket.addEventListener("message", (event) => {
@@ -1375,7 +1389,10 @@ async function connectToDraft(options = {}) {
     updateConnectionState(`Disconnected${event.reason ? `: ${event.reason}` : ""}`);
     elements.connectButton.disabled = false;
     elements.disconnectButton.disabled = true;
+    elements.collabChatSend.disabled = true;
+    elements.collabChatInput.disabled = true;
     renderCollaborators([]);
+    renderDraftChat([]);
     draftSocket = null;
   });
   socket.addEventListener("error", () => {
@@ -1405,10 +1422,15 @@ function handleDraftSocketMessage(rawPayload) {
     } else if (drafterSettings.paper.trim()) {
       flushDraftSync("viewing");
     }
+    renderDraftChat(payload.chatMessages);
     return;
   }
   if (payload.type === "draft_update" && typeof payload.content === "string" && payload.content !== drafterSettings.paper) {
     applyRemotePaper(payload.content);
+    return;
+  }
+  if (payload.type === "draft_chat") {
+    appendDraftChatMessage(payload.message);
   }
 }
 
@@ -1427,6 +1449,63 @@ function sendPresence(state) {
   if (draftSocket?.readyState === WebSocket.OPEN) {
     draftSocket.send(JSON.stringify({ type: "presence", state }));
   }
+}
+
+function sendDraftChatMessage() {
+  if (draftSocket?.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  const content = String(elements.collabChatInput.value || "").trim();
+  if (!content) {
+    return;
+  }
+  draftSocket.send(JSON.stringify({ type: "draft_chat", content }));
+  elements.collabChatInput.value = "";
+}
+
+function renderDraftChat(messages) {
+  draftChatMessages = Array.isArray(messages) ? messages.slice(-80) : [];
+  elements.collabChatMessages.innerHTML = "";
+  if (!draftChatMessages.length) {
+    const empty = document.createElement("div");
+    empty.className = "history-meta";
+    empty.textContent = "No messages yet.";
+    elements.collabChatMessages.append(empty);
+    return;
+  }
+  draftChatMessages.forEach((message) => {
+    elements.collabChatMessages.append(buildDraftChatMessageNode(message));
+  });
+  elements.collabChatMessages.scrollTop = elements.collabChatMessages.scrollHeight;
+}
+
+function appendDraftChatMessage(message) {
+  if (!message || typeof message !== "object") {
+    return;
+  }
+  draftChatMessages.push(message);
+  draftChatMessages = draftChatMessages.slice(-80);
+  if (draftChatMessages.length === 1) {
+    elements.collabChatMessages.innerHTML = "";
+  }
+  elements.collabChatMessages.append(buildDraftChatMessageNode(message));
+  elements.collabChatMessages.scrollTop = elements.collabChatMessages.scrollHeight;
+}
+
+function buildDraftChatMessageNode(message) {
+  const item = document.createElement("article");
+  item.className = "drafter-chat-message";
+  const sender = escapeHtml(String(message.sender || "guest"));
+  const content = escapeHtml(String(message.content || ""));
+  const stamp = formatTimestamp(message.createdAt);
+  item.innerHTML = `
+    <div class="drafter-chat-meta">
+      <strong>${sender}</strong>
+      <span class="room-meta-tail">${escapeHtml(stamp)}</span>
+    </div>
+    <div class="drafter-chat-content">${content}</div>
+  `;
+  return item;
 }
 
 function scheduleDraftSync(state = "editing") {
@@ -1491,6 +1570,11 @@ function presenceLabelFor(state) {
     return "idle";
   }
   return "viewing";
+}
+
+function formatTimestamp(value) {
+  const timestamp = Number(value || Date.now());
+  return new Date(timestamp).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 }
 
 function initializeLatexEditor() {

@@ -35,9 +35,11 @@ BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 DRAFTER_ASSETS_DIR = STATIC_DIR / "drafter_uploads"
 DOWNLOADS_DIR = BASE_DIR.parent / "downloads"
+ROOM_STATE_PATH = BASE_DIR / "room_state.json"
 ROOM_HISTORY_LIMIT = 120
 ROOM_CONTEXT_MESSAGE_LIMIT = 18
 ROOM_CONTEXT_CHAR_BUDGET = 16000
+DRAFT_CHAT_HISTORY_LIMIT = 80
 DRAFTER_TEXT_ASSET_LIMIT = 250_000
 DRAFTER_IMAGE_ASSET_LIMIT = 3_500_000
 DRAFTER_ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
@@ -77,6 +79,7 @@ app.add_middleware(NoCacheMiddleware)
 class RoomState:
     clients: set[WebSocket] = field(default_factory=set)
     history: list[dict[str, Any]] = field(default_factory=list)
+    focus_mode: bool = False
 
 
 @dataclass
@@ -92,19 +95,23 @@ class DraftState:
     clients: dict[WebSocket, DraftCollaborator] = field(default_factory=dict)
     content: str = ""
     updated_at: int = 0
+    chat_history: list[dict[str, Any]] = field(default_factory=list)
 
 
 class RoomHub:
     def __init__(self) -> None:
-        self._rooms: dict[str, RoomState] = {}
+        self._rooms: dict[str, RoomState] = self._load_rooms()
         self._lock = asyncio.Lock()
 
-    async def connect(self, room_name: str, websocket: WebSocket) -> list[dict[str, Any]]:
+    async def connect(self, room_name: str, websocket: WebSocket) -> dict[str, Any]:
         await websocket.accept()
         async with self._lock:
             room = self._rooms.setdefault(room_name, RoomState())
             room.clients.add(websocket)
-            return list(room.history)
+            return {
+                "messages": list(room.history),
+                "focusMode": room.focus_mode,
+            }
 
     async def disconnect(self, room_name: str, websocket: WebSocket) -> None:
         async with self._lock:
@@ -123,20 +130,125 @@ class RoomHub:
     async def append_and_broadcast(self, room_name: str, message: dict[str, Any]) -> None:
         async with self._lock:
             room = self._rooms.setdefault(room_name, RoomState())
+            message.setdefault("reactions", {})
             room.history.append(message)
             if len(room.history) > ROOM_HISTORY_LIMIT:
                 room.history = room.history[-ROOM_HISTORY_LIMIT:]
+            self._persist_locked()
             clients = list(room.clients)
+        await self._broadcast_clients(room_name, clients, message)
 
+    async def broadcast(self, room_name: str, payload: dict[str, Any]) -> None:
+        async with self._lock:
+            room = self._rooms.setdefault(room_name, RoomState())
+            clients = list(room.clients)
+        await self._broadcast_clients(room_name, clients, payload)
+
+    async def set_focus_mode(self, room_name: str, enabled: bool) -> bool:
+        async with self._lock:
+            room = self._rooms.setdefault(room_name, RoomState())
+            if room.focus_mode == enabled:
+                return False
+            room.focus_mode = enabled
+            self._persist_locked()
+            return True
+
+    async def toggle_reaction(
+        self,
+        room_name: str,
+        *,
+        message_id: str,
+        emoji: str,
+        username: str,
+    ) -> dict[str, dict[str, Any]] | None:
+        async with self._lock:
+            room = self._rooms.get(room_name)
+            if room is None:
+                return None
+            for message in room.history:
+                if str(message.get("id")) != message_id:
+                    continue
+                reactions = message.setdefault("reactions", {})
+                reaction_state = reactions.get(emoji) or {"count": 0, "users": []}
+                users = [str(item) for item in reaction_state.get("users", []) if str(item)]
+                user_set = set(users)
+                if username in user_set:
+                    users = [item for item in users if item != username]
+                else:
+                    users.append(username)
+                users.sort(key=str.lower)
+                if users:
+                    reactions[emoji] = {"count": len(users), "users": users}
+                else:
+                    reactions.pop(emoji, None)
+                self._persist_locked()
+                return reactions
+        return None
+
+    async def delete_message(self, room_name: str, message_id: str) -> bool:
+        async with self._lock:
+            room = self._rooms.get(room_name)
+            if room is None:
+                return False
+            original_len = len(room.history)
+            room.history = [item for item in room.history if str(item.get("id")) != message_id]
+            deleted = len(room.history) < original_len
+            if deleted:
+                self._persist_locked()
+            return deleted
+
+    async def _broadcast_clients(self, room_name: str, clients: list[WebSocket], payload: dict[str, Any]) -> None:
         stale_clients: list[WebSocket] = []
         for client in clients:
             try:
-                await client.send_json(message)
+                await client.send_json(payload)
             except Exception:
                 stale_clients.append(client)
 
         for client in stale_clients:
             await self.disconnect(room_name, client)
+
+    def _load_rooms(self) -> dict[str, RoomState]:
+        if not ROOM_STATE_PATH.exists():
+            return {}
+        try:
+            payload = json.loads(ROOM_STATE_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return {}
+
+        rooms_payload = payload.get("rooms") if isinstance(payload, dict) else {}
+        if not isinstance(rooms_payload, dict):
+            return {}
+
+        rooms: dict[str, RoomState] = {}
+        for room_name, room_value in rooms_payload.items():
+            normalized_name = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(room_name).strip()).strip("-").lower()[:40]
+            if not normalized_name:
+                continue
+            if not isinstance(room_value, dict):
+                continue
+            raw_history = room_value.get("history")
+            history = [item for item in raw_history if isinstance(item, dict)] if isinstance(raw_history, list) else []
+            rooms[normalized_name] = RoomState(
+                history=history[-ROOM_HISTORY_LIMIT:],
+                focus_mode=bool(room_value.get("focusMode", False)),
+            )
+        return rooms
+
+    def _persist_locked(self) -> None:
+        serialized = {
+            "rooms": {
+                room_name: {
+                    "focusMode": room.focus_mode,
+                    "history": room.history[-ROOM_HISTORY_LIMIT:],
+                }
+                for room_name, room in self._rooms.items()
+            }
+        }
+        try:
+            ROOM_STATE_PATH.write_text(json.dumps(serialized, ensure_ascii=True, indent=2), encoding="utf-8")
+        except OSError:
+            return
 
 
 room_hub = RoomHub()
@@ -157,6 +269,7 @@ class DraftHub:
                 "content": draft.content,
                 "updatedAt": draft.updated_at,
                 "collaborators": self._serialize_collaborators(draft),
+                "chatMessages": list(draft.chat_history),
             }
 
     async def disconnect(self, draft_name: str, websocket: WebSocket) -> None:
@@ -165,7 +278,7 @@ class DraftHub:
             if draft is None:
                 return
             draft.clients.pop(websocket, None)
-            if not draft.clients and not draft.content:
+            if not draft.clients and not draft.content and not draft.chat_history:
                 self._drafts.pop(draft_name, None)
 
     async def broadcast_presence(self, draft_name: str) -> None:
@@ -220,6 +333,26 @@ class DraftHub:
             }
         await self._broadcast(draft_name, payload)
 
+    async def append_chat_message(self, draft_name: str, *, sender_name: str, content: str) -> None:
+        async with self._lock:
+            draft = self._drafts.setdefault(draft_name, DraftState())
+            message = {
+                "id": secrets.token_hex(10),
+                "sender": sender_name,
+                "content": content,
+                "createdAt": int(time.time() * 1000),
+            }
+            draft.chat_history.append(message)
+            if len(draft.chat_history) > DRAFT_CHAT_HISTORY_LIMIT:
+                draft.chat_history = draft.chat_history[-DRAFT_CHAT_HISTORY_LIMIT:]
+            payload = {
+                "type": "draft_chat",
+                "draft": draft_name,
+                "message": message,
+                "collaborators": self._serialize_collaborators(draft),
+            }
+        await self._broadcast(draft_name, payload)
+
     async def _broadcast(self, draft_name: str, payload: dict[str, Any]) -> None:
         async with self._lock:
             draft = self._drafts.get(draft_name)
@@ -241,7 +374,7 @@ class DraftHub:
                 return
             for client in stale_clients:
                 draft.clients.pop(client, None)
-            if not draft.clients and not draft.content:
+            if not draft.clients and not draft.content and not draft.chat_history:
                 self._drafts.pop(draft_name, None)
 
     def _serialize_collaborators(self, draft: DraftState) -> list[dict[str, Any]]:
@@ -400,6 +533,12 @@ async def api_models() -> list[ModelResponse]:
     ]
 
 
+@app.get("/api/client/runtime")
+async def client_runtime() -> dict[str, str]:
+    settings = get_settings()
+    return {"ollamaBaseUrl": settings.ollama_base_url}
+
+
 @app.get("/v1/models")
 async def openai_models() -> dict:
     return {
@@ -463,14 +602,17 @@ async def room_socket(websocket: WebSocket, room_name: str) -> None:
         return
     normalized_room = normalize_room_name(room_name)
     username = normalize_room_name(websocket.query_params.get("name") or "guest", fallback="guest")
-    history = await room_hub.connect(normalized_room, websocket)
+    snapshot = await room_hub.connect(normalized_room, websocket)
+    pending_ai_requests: dict[str, dict[str, str]] = {}
 
     try:
         await websocket.send_json(
             {
                 "type": "history",
                 "room": normalized_room,
-                "messages": history,
+                "messages": snapshot["messages"],
+                "focusMode": bool(snapshot.get("focusMode")),
+                "canDeleteMessages": can_manage_room_messages(websocket),
             }
         )
         await room_hub.append_and_broadcast(
@@ -485,7 +627,114 @@ async def room_socket(websocket: WebSocket, room_name: str) -> None:
 
         while True:
             payload = await websocket.receive_json()
-            if payload.get("type") != "chat":
+            event_type = str(payload.get("type") or "").strip().lower()
+
+            if event_type == "reaction_toggle":
+                message_id = str(payload.get("messageId") or "").strip()
+                emoji = normalize_reaction_emoji(payload.get("emoji"))
+                if not message_id or not emoji:
+                    continue
+                reactions = await room_hub.toggle_reaction(
+                    normalized_room,
+                    message_id=message_id,
+                    emoji=emoji,
+                    username=username,
+                )
+                if reactions is None:
+                    continue
+                await room_hub.broadcast(
+                    normalized_room,
+                    {
+                        "type": "reaction_update",
+                        "messageId": message_id,
+                        "reactions": reactions,
+                        "updatedBy": username,
+                        "updatedAt": int(time.time() * 1000),
+                    },
+                )
+                continue
+
+            if event_type == "delete_message":
+                if not can_manage_room_messages(websocket):
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "detail": "You are not allowed to delete messages in this room.",
+                        }
+                    )
+                    continue
+                message_id = str(payload.get("messageId") or "").strip()
+                if not message_id:
+                    continue
+                deleted = await room_hub.delete_message(normalized_room, message_id)
+                if not deleted:
+                    continue
+                await room_hub.broadcast(
+                    normalized_room,
+                    {
+                        "type": "message_deleted",
+                        "messageId": message_id,
+                        "deletedBy": username,
+                        "deletedAt": int(time.time() * 1000),
+                    },
+                )
+                continue
+
+            if event_type == "focus_mode":
+                enabled = bool(payload.get("enabled"))
+                changed = await room_hub.set_focus_mode(normalized_room, enabled)
+                if not changed:
+                    continue
+                await room_hub.broadcast(
+                    normalized_room,
+                    {
+                        "type": "focus_mode",
+                        "enabled": enabled,
+                        "updatedBy": username,
+                        "updatedAt": int(time.time() * 1000),
+                    },
+                )
+                continue
+
+            if event_type == "ai_result":
+                request_id = str(payload.get("requestId") or "").strip()
+                pending = pending_ai_requests.pop(request_id, None)
+                if pending is None:
+                    continue
+
+                resolved_model_id = str(payload.get("modelId") or pending["model_id"])
+                error_text = str(payload.get("error") or "").strip()
+                if error_text:
+                    await room_hub.append_and_broadcast(
+                        normalized_room,
+                        build_room_event(
+                            event_type="system",
+                            sender="system",
+                            speaker_type="system",
+                            content=f"@ai failed: {error_text}",
+                            model_id=resolved_model_id,
+                        ),
+                    )
+                    continue
+
+                ai_reply = str(payload.get("content") or "").strip() or "I did not have a useful reply for that."
+                reply_sender = normalize_room_label(
+                    payload.get("agentName") or pending["agent_name"],
+                    fallback=pending["agent_name"],
+                )
+                await room_hub.append_and_broadcast(
+                    normalized_room,
+                    build_room_event(
+                        event_type="chat",
+                        sender=reply_sender,
+                        speaker_type="ai",
+                        content=ai_reply,
+                        model_id=resolved_model_id,
+                    ),
+                )
+                continue
+
+            if event_type != "chat":
                 continue
 
             content = str(payload.get("content") or "").strip()
@@ -508,48 +757,40 @@ async def room_socket(websocket: WebSocket, room_name: str) -> None:
             await room_hub.append_and_broadcast(normalized_room, user_message)
 
             if mentions_ai(content):
+                request_id = secrets.token_hex(8)
+                history = await room_hub.snapshot(normalized_room)
+                ai_messages = build_room_ai_messages(
+                    history,
+                    requester_name=username,
+                    agent_name=agent_name,
+                    system_prompt=system_prompt,
+                )
+                pending_ai_requests[request_id] = {
+                    "agent_name": agent_name,
+                    "model_id": model_id,
+                }
                 await room_hub.append_and_broadcast(
                     normalized_room,
                     build_room_event(
                         event_type="system",
                         sender="system",
                         speaker_type="system",
-                        content=f"{agent_name} is replying with {model_id}.",
+                        content=f"{agent_name} is generating a local reply with {model_id}.",
                         model_id=model_id,
                     ),
                 )
-                try:
-                    ai_reply = await generate_room_ai_reply(
-                        room_name=normalized_room,
-                        requester_name=username,
-                        agent_name=agent_name,
-                        system_prompt=system_prompt,
-                        model_id=model_id,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                    )
-                except ProviderError as exc:
-                    await room_hub.append_and_broadcast(
-                        normalized_room,
-                        build_room_event(
-                            event_type="system",
-                            sender="system",
-                            speaker_type="system",
-                            content=f"@ai failed: {exc}",
-                            model_id=model_id,
-                        ),
-                    )
-                    continue
-
-                await room_hub.append_and_broadcast(
-                    normalized_room,
-                    build_room_event(
-                        event_type="chat",
-                        sender=agent_name,
-                        speaker_type="ai",
-                        content=ai_reply,
-                        model_id=model_id,
-                    ),
+                await websocket.send_json(
+                    {
+                        "type": "ai_request",
+                        "requestId": request_id,
+                        "room": normalized_room,
+                        "requester": username,
+                        "agentName": agent_name,
+                        "modelId": model_id,
+                        "temperature": temperature,
+                        "maxTokens": max_tokens,
+                        "messages": [message.model_dump() for message in ai_messages],
+                    }
                 )
     except WebSocketDisconnect:
         pass
@@ -586,6 +827,7 @@ async def draft_socket(websocket: WebSocket, draft_name: str) -> None:
                 "content": snapshot["content"],
                 "updatedAt": snapshot["updatedAt"],
                 "collaborators": snapshot["collaborators"],
+                "chatMessages": snapshot["chatMessages"],
             }
         )
         await draft_hub.broadcast_presence(normalized_draft)
@@ -599,6 +841,17 @@ async def draft_socket(websocket: WebSocket, draft_name: str) -> None:
                     normalized_draft,
                     websocket,
                     normalize_draft_presence_state(payload.get("state")),
+                )
+                continue
+
+            if event_type == "draft_chat":
+                chat_text = normalize_draft_chat_content(payload.get("content"))
+                if not chat_text:
+                    continue
+                await draft_hub.append_chat_message(
+                    normalized_draft,
+                    sender_name=username,
+                    content=chat_text,
                 )
                 continue
 
@@ -647,6 +900,15 @@ def collaboration_client_allowed(connection: Request | WebSocket) -> bool:
         return True
     if not settings.collaboration_allow_remote_clients:
         return False
+    allowed_hosts = set(settings.collaboration_allowed_client_ips)
+    return "*" in allowed_hosts or host in allowed_hosts
+
+
+def can_manage_room_messages(connection: Request | WebSocket) -> bool:
+    host = connection_host(connection)
+    if is_loopback_host(host):
+        return True
+    settings = get_settings()
     allowed_hosts = set(settings.collaboration_allowed_client_ips)
     return "*" in allowed_hosts or host in allowed_hosts
 
@@ -702,8 +964,21 @@ def normalize_room_system_prompt(value: Any) -> str:
     return str(value or "").strip()[:4000]
 
 
+def normalize_reaction_emoji(value: Any) -> str:
+    candidate = str(value or "").strip()
+    if not candidate:
+        return ""
+    candidate = re.sub(r"\s+", "", candidate)
+    return candidate[:16]
+
+
 def normalize_draft_content(value: Any) -> str:
     return str(value or "")[:200000]
+
+
+def normalize_draft_chat_content(value: Any) -> str:
+    cleaned = re.sub(r"\s+", " ", str(value or "")).strip()
+    return cleaned[:1200]
 
 
 def normalize_draft_presence_state(value: Any, fallback: str = "viewing") -> str:
@@ -841,37 +1116,6 @@ def build_room_ai_messages(
 
     trimmed = trim_room_context(transcript)
     return [ChatMessage(role="system", content=" ".join(system_parts)), *trimmed]
-
-
-async def generate_room_ai_reply(
-    *,
-    room_name: str,
-    requester_name: str,
-    agent_name: str,
-    system_prompt: str,
-    model_id: str,
-    temperature: float,
-    max_tokens: int,
-) -> str:
-    history = await room_hub.snapshot(room_name)
-    messages = build_room_ai_messages(
-        history,
-        requester_name=requester_name,
-        agent_name=agent_name,
-        system_prompt=system_prompt,
-    )
-
-    request = ChatCompletionRequest(
-        model=model_id,
-        messages=messages,
-        stream=False,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
-    resolved = resolve_model(model_id)
-    reply = await complete_text(request, resolved)
-    cleaned = (reply or "").strip()
-    return cleaned or "I did not have a useful reply for that."
 
 
 def run() -> None:

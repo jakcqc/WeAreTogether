@@ -93,9 +93,11 @@
               <div class="pixel-box-title">Room Notes</div>
               <div class="pixel-box-body">
                 <p><strong>Transcript:</strong> everyone in the room sees the same messages and AI completions.</p>
-                <p><strong>AI owner:</strong> <code>@ai</code> uses the sender's selected room agent, model, and prompt.</p>
+                <p><strong>AI owner:</strong> <code>@ai</code> runs on the sender's own runtime URL and sends results back to the room.</p>
+                <p><strong>Your runtime:</strong> <code id="room-runtime-label">loading...</code> (from <code>OLLAMA_BASE_URL</code> on this client server)</p>
                 <p><strong>Remote target:</strong> point this page at a LocalChat server exposing <code>/ws/rooms/&lt;room&gt;</code>.</p>
                 <p><strong>Private collab:</strong> keep the host's room page local-only and have collaborators run LocalChat from source with the host IP.</p>
+                <button id="focus-room-button" class="secondary-button" type="button" disabled>Focus Mode: Off</button>
               </div>
             </div>
           </div>
@@ -113,7 +115,7 @@
                 <div class="empty-card">
                   <p class="eyebrow">Room Ready</p>
                   <h3>Connect to a room and start talking.</h3>
-                  <p>The room transcript is shared. When you type <code>@ai</code>, the server will post a reply generated from your own room agent settings.</p>
+                  <p>The room transcript is shared. When you type <code>@ai</code>, your browser runs the model on your own runtime and posts the result.</p>
                   <div class="empty-links">
                     <span>join room</span>
                     <span>shared transcript</span>

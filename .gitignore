@@ -18,3 +18,4 @@ downloads/
 ads/
 ad/
 *.ads
+localchat/localchat/room_state.json
