@@ -3,9 +3,11 @@ const DRAFTER_LEGACY_SETTINGS_KEY = "localchat.drafter.settings.v2";
 const DRAFTER_AGENTS_KEY = "localchat.drafter.agents.v1";
 const DRAFTER_SNAPSHOTS_KEY = "localchat.drafter.snapshots.v1";
 const DRAFTER_ASSETS_API_PATH = "/api/drafter/assets";
+const DRAFTER_COMPILE_API_PATH = "/api/drafter/compile";
 const DEFAULT_AGENT_ID = "custom";
 const DEFAULT_MODEL_ID = "ollama:qwen2.5:7b";
 const SYNC_DEBOUNCE_MS = 180;
+const COMPILE_DEBOUNCE_MS = 1100;
 const MAX_IMAGE_UPLOAD_BYTES = 3_500_000;
 const MAX_TEXT_UPLOAD_BYTES = 250_000;
 const DEFAULT_LEFT_RAIL_WIDTH = 380;
@@ -98,6 +100,7 @@ const elements = {
   collabChatInput: document.querySelector("#drafter-collab-chat-input"),
   collabChatSend: document.querySelector("#drafter-collab-chat-send"),
   compileLog: document.querySelector("#compile-log"),
+  compileNowButton: document.querySelector("#compile-now-button"),
   compileStatusLabel: document.querySelector("#compile-status-label"),
   connectButton: document.querySelector("#connect-drafter-button"),
   connectionLabel: document.querySelector("#drafter-connection-label"),
@@ -119,6 +122,7 @@ const elements = {
   leftResizer: document.querySelector("#drafter-left-resizer"),
   leftStack: document.querySelector("#drafter-left-stack"),
   modelSelect: document.querySelector("#drafter-model-select"),
+  openCompiledPdfButton: document.querySelector("#open-compiled-pdf-button"),
   previewPane: document.querySelector("#preview-pane"),
   previewPaneShell: document.querySelector("#drafter-preview-pane-shell"),
   previewToggleButton: document.querySelector("#drafter-preview-toggle"),
@@ -153,6 +157,10 @@ let currentMode = drafterSettings.mode || "ask";
 let pendingDiffTarget = "";
 let draftSocket = null;
 let syncTimer = null;
+let compileTimer = null;
+let compileInFlight = false;
+let compileQueued = false;
+let latestCompiledPdfUrl = "";
 let draftChatMessages = [];
 let remoteApplyInProgress = false;
 let suppressEditorEvents = false;
@@ -179,6 +187,7 @@ updateAgentPanelUi();
 applyLayoutState();
 setCenterPaneMode(currentLayout.centerMode);
 await connectToDraft();
+scheduleCompile("initial");
 
 function bindEvents() {
   bindLatexEditorEvents();
@@ -219,7 +228,9 @@ function bindEvents() {
   elements.runButton.addEventListener("click", () => void runAi());
   elements.saveDraftButton.addEventListener("click", saveSnapshot);
   elements.downloadDraftButton.addEventListener("click", downloadDraftFile);
-  elements.exportPdfButton.addEventListener("click", exportPreviewPdf);
+  elements.exportPdfButton.addEventListener("click", () => void exportPreviewPdf());
+  elements.compileNowButton.addEventListener("click", () => void compileLatex({ manual: true, reason: "manual" }));
+  elements.openCompiledPdfButton.addEventListener("click", openCompiledPdf);
   elements.applyDiffButton.addEventListener("click", applyPendingDiff);
   elements.latexToggleButton.addEventListener("click", () => toggleCenterPane("latex"));
   elements.previewToggleButton.addEventListener("click", () => toggleCenterPane("preview"));
@@ -243,9 +254,11 @@ function bindLatexEditorEvents() {
     }
     drafterSettings.paper = getEditorText();
     persistSettings();
-    renderPreview();
+    if (!latestCompiledPdfUrl) {
+      renderPreview();
+    }
     updateEditorStats();
-    updateCompileLogForPaper();
+    scheduleCompile("edit");
     const insertedText = delta.action === "insert" ? delta.lines.join("\n") : "";
     if (insertedText.includes("\\")) {
       window.setTimeout(() => latexEditor?.execCommand("startAutocomplete"), 0);
@@ -268,6 +281,9 @@ async function onSessionFieldChange() {
     return;
   }
   elements.draftRoomLabel.textContent = drafterSettings.roomName;
+  latestCompiledPdfUrl = "";
+  updateCompileButtons();
+  renderPreview();
   await loadModelsForServer(drafterSettings.serverUrl, { force: true });
   await loadAssets();
   await connectToDraft({ forceReconnect: true });
@@ -811,12 +827,18 @@ async function loadAssets() {
       persistSettings();
     }
     renderAssetShelf();
-    renderPreview();
+    if (!latestCompiledPdfUrl) {
+      renderPreview();
+    }
+    scheduleCompile("assets");
   } catch (error) {
     drafterAssets = [];
     selectedAssetName = "";
     renderAssetShelf(`Assets unavailable: ${error instanceof Error ? error.message : String(error)}`);
-    renderPreview();
+    if (!latestCompiledPdfUrl) {
+      renderPreview();
+    }
+    scheduleCompile("assets");
   }
 }
 
@@ -1038,40 +1060,115 @@ function renderCollaborators(collaborators) {
 }
 
 function renderCompileLog() {
-  updateCompileLogForPaper();
+  elements.compileLog.textContent = "[compile] waiting for first real LaTeX compile...";
+  elements.compileStatusLabel.textContent = "WARN";
+  updateCompileButtons();
 }
 
-function updateCompileLogForPaper() {
-  const paper = getEditorText();
-  const hasDocument = /\\begin\{document\}/.test(paper) && /\\end\{document\}/.test(paper);
-  const hasTitle = /\\title\{/.test(paper);
-  const explicitPageBreaks = (paper.match(/\\(?:newpage|clearpage|pagebreak)/g) || []).length;
-  const packageMatches = [...paper.matchAll(/\\usepackage(?:\[[^\]]*\])?\{([^}]+)\}/g)];
-  const packages = packageMatches.flatMap((match) => match[1].split(",").map((item) => item.trim()).filter(Boolean));
-  const warnings = [];
-  if (!hasTitle) {
-    warnings.push("warning: missing \\title{...}");
+function updateCompileButtons() {
+  if (elements.compileNowButton) {
+    elements.compileNowButton.disabled = compileInFlight;
   }
-  if (!hasDocument) {
-    warnings.push("error: missing document environment");
+  if (elements.openCompiledPdfButton) {
+    elements.openCompiledPdfButton.disabled = !latestCompiledPdfUrl;
   }
-  if (!/\\documentclass/.test(paper)) {
-    warnings.push("warning: missing \\documentclass{...}");
+}
+
+function scheduleCompile(reason = "edit") {
+  clearTimeout(compileTimer);
+  compileTimer = window.setTimeout(() => {
+    compileTimer = null;
+    void compileLatex({ reason });
+  }, COMPILE_DEBOUNCE_MS);
+}
+
+async function compileLatex(options = {}) {
+  const manual = Boolean(options.manual);
+  if (compileInFlight) {
+    compileQueued = true;
+    return null;
   }
-  const lines = [
-    "[pdfLaTeX] compiling main.tex",
-    hasDocument ? "[pdfLaTeX] document structure detected" : "[pdfLaTeX] document structure invalid",
-    `[pdfLaTeX] preamble packages: ${packages.length ? packages.join(", ") : "none"}`,
-    `[pdfLaTeX] explicit page breaks: ${explicitPageBreaks}`,
-    warnings.length ? warnings.join("\n") : "[pdfLaTeX] compile completed with 0 warnings",
-  ];
-  elements.compileLog.textContent = lines.join("\n");
-  const clean = hasDocument && !warnings.length;
-  elements.compileStatusLabel.textContent = clean ? "CLEAN" : warnings.some((line) => line.startsWith("error")) ? "ERROR" : "WARN";
+  compileInFlight = true;
+  updateCompileButtons();
+  if (manual) {
+    activatePanel(currentLayout.left.includes("compile") ? "left" : "right", "compile");
+  }
+  elements.compileStatusLabel.textContent = "BUILD";
+  elements.compileLog.textContent = `[compile] running (${String(options.reason || "update")})...`;
+
+  try {
+    const response = await fetch(buildApiUrl(drafterSettings.serverUrl, DRAFTER_COMPILE_API_PATH), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        content: getEditorText(),
+      }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(payload.detail || "Compile request failed");
+    }
+
+    const compileLog = String(payload?.log || "").trim();
+    elements.compileLog.textContent = compileLog || "[compile] no compiler output returned.";
+
+    if (!payload?.success) {
+      elements.compileStatusLabel.textContent = "ERROR";
+      return payload;
+    }
+
+    elements.compileStatusLabel.textContent = payload.status === "warn" ? "WARN" : "CLEAN";
+    const relativePdfUrl = String(payload.pdfUrl || "").trim();
+    if (!relativePdfUrl) {
+      throw new Error("Compile succeeded but no PDF URL was returned.");
+    }
+    const base = normalizeServerBase(drafterSettings.serverUrl);
+    const pdfUrl = new URL(relativePdfUrl, base);
+    pdfUrl.searchParams.set("t", String(payload.compiledAt || Date.now()));
+    latestCompiledPdfUrl = pdfUrl.toString();
+    renderCompiledPdf(latestCompiledPdfUrl);
+    if (Boolean(options.openPdf)) {
+      window.open(latestCompiledPdfUrl, "_blank", "noopener,noreferrer");
+    }
+    return payload;
+  } catch (error) {
+    elements.compileStatusLabel.textContent = "ERROR";
+    elements.compileLog.textContent = `[error] ${error instanceof Error ? error.message : String(error)}`;
+    return null;
+  } finally {
+    compileInFlight = false;
+    updateCompileButtons();
+    if (compileQueued) {
+      compileQueued = false;
+      scheduleCompile("queued");
+    }
+  }
+}
+
+function renderCompiledPdf(url) {
+  const source = String(url || "").trim();
+  if (!source) {
+    return;
+  }
+  elements.previewPane.classList.add("has-pdf");
+  const frame = document.createElement("iframe");
+  frame.className = "paper-preview-frame";
+  frame.src = `${source}#toolbar=1&navpanes=0&view=FitH`;
+  frame.title = "Compiled LaTeX PDF";
+  frame.loading = "eager";
+  elements.previewPane.innerHTML = "";
+  elements.previewPane.append(frame);
+}
+
+function openCompiledPdf() {
+  if (!latestCompiledPdfUrl) {
+    return;
+  }
+  window.open(latestCompiledPdfUrl, "_blank", "noopener,noreferrer");
 }
 
 function updateEditorStats() {
-  const value = getEditorText();
+  const value = stripLatexComments(getEditorText());
   const wordCount = value
     .replace(/\\[a-zA-Z*]+(\[[^\]]*\])?(\{[^}]*\})?/g, " ")
     .replace(/[{}\\]/g, " ")
@@ -1091,7 +1188,8 @@ function updateCursorPosition() {
 }
 
 function renderPreview() {
-  const source = getEditorText();
+  elements.previewPane.classList.remove("has-pdf");
+  const source = stripLatexComments(getEditorText());
   const documentClass = parseDocumentClass(source);
   const packages = parseUsePackages(source);
   const title = matchLatex(source, /\\title\{([^}]*)\}/) || "Untitled Draft";
@@ -1279,12 +1377,14 @@ function applyModelDefaults(modelId) {
 }
 
 function handleAskResponse(text) {
-  elements.response.innerHTML = DOMPurify.sanitize(marked.parse(text || "No response."));
-  elements.agentExplanation.textContent = "Ask mode does not generate a diff.";
-  elements.agentDiff.textContent = "No diff yet.";
-  elements.proposalMeta.textContent = "Question answered from current draft context";
+  const answer = String(text || "No response.");
+  elements.response.innerHTML = DOMPurify.sanitize(marked.parse(answer));
+  elements.agentExplanation.textContent = answer;
+  elements.agentDiff.textContent = "No diff generated in Ask mode.";
+  elements.proposalMeta.textContent = `Ask response at ${new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`;
   elements.lastDiffStatus.textContent = "none";
   elements.applyDiffButton.disabled = true;
+  activateProposalPanel();
 }
 
 function handleAgentResponse(text) {
@@ -1299,18 +1399,32 @@ function handleAgentResponse(text) {
     pendingDiffTarget = appliedText;
     elements.applyDiffButton.disabled = false;
     elements.lastDiffStatus.textContent = "proposal ready";
-    activatePanel(currentLayout.left.includes("proposal") ? "left" : "right", "proposal");
   } else {
     pendingDiffTarget = "";
     elements.applyDiffButton.disabled = true;
     elements.lastDiffStatus.textContent = "diff not applicable";
   }
+  activateProposalPanel();
+}
+
+function activateProposalPanel() {
+  activatePanel(currentLayout.left.includes("proposal") ? "left" : "right", "proposal");
 }
 
 function parseAgentResponse(text) {
   const explanationMatch = text.match(/EXPLANATION:\s*([\s\S]*?)(?:\nDIFF:|$)/i);
   const diffMatch = text.match(/DIFF:\s*([\s\S]*)$/i);
-  return { explanation: explanationMatch?.[1]?.trim() || text.trim(), diff: diffMatch?.[1]?.trim() || "" };
+  let diff = normalizeAgentDiff(diffMatch?.[1] || "");
+  if (!diff) {
+    const inferred = normalizeAgentDiff(text);
+    if (inferred.includes("@@")) {
+      diff = inferred;
+    }
+  }
+  return {
+    explanation: explanationMatch?.[1]?.trim() || text.trim(),
+    diff,
+  };
 }
 
 function applyPendingDiff() {
@@ -1323,9 +1437,11 @@ function applyPendingDiff() {
   elements.applyDiffButton.disabled = true;
   elements.lastDiffStatus.textContent = "applied";
   persistSettings();
-  renderPreview();
+  if (!latestCompiledPdfUrl) {
+    renderPreview();
+  }
   updateEditorStats();
-  updateCompileLogForPaper();
+  scheduleCompile("apply-diff");
   flushDraftSync("editing");
 }
 
@@ -1342,62 +1458,13 @@ function downloadDraftFile() {
   elements.lastDiffStatus.textContent = "main.tex downloaded";
 }
 
-function exportPreviewPdf() {
-  const previewMarkup = elements.previewPane?.innerHTML?.trim();
-  if (!previewMarkup) {
-    elements.lastDiffStatus.textContent = "preview unavailable";
+async function exportPreviewPdf() {
+  const result = await compileLatex({ manual: true, reason: "export", openPdf: true });
+  if (result?.success) {
+    elements.lastDiffStatus.textContent = "compiled pdf opened";
     return;
   }
-  const exportWindow = window.open("", "_blank", "noopener,noreferrer,width=1080,height=900");
-  if (!exportWindow) {
-    elements.lastDiffStatus.textContent = "popup blocked";
-    return;
-  }
-  exportWindow.document.write(`<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>main.pdf</title>
-  <style>
-    body { margin: 0; background: #f1f1f1; font-family: Georgia, "Times New Roman", serif; }
-    .paper-preview { padding: 24px; }
-    .paper-preview-deck { display: grid; gap: 24px; }
-    .paper-sheet { width: 8.5in; min-height: 11in; margin: 0 auto; padding: 0.7in; background: #fffefb; box-sizing: border-box; }
-    .preview-page { position: relative; }
-    .paper-page-body { min-height: 8.8in; }
-    .paper-sheet-header { text-align: center; border-bottom: 1px solid #d6d1c3; padding-bottom: 18px; margin-bottom: 24px; }
-    .paper-sheet-header h2 { margin: 0; color: #18284f; font-size: 1.8rem; }
-    .paper-authors { margin: 10px 0 0; color: #5a5f78; }
-    .paper-date, .paper-class-line, .paper-continuation, .paper-page-footer { color: #66708a; font-size: 0.82rem; }
-    .paper-page-footer { margin-top: 18px; text-align: right; }
-    .preview-abstract, .preview-section { margin-bottom: 22px; }
-    .preview-section h3 { margin: 0 0 10px; color: #1f376b; }
-    .preview-section p, .preview-abstract p { margin: 0; color: #22263a; line-height: 1.7; }
-    .preview-subsection-block h4, .preview-subsection h4 { margin: 0 0 10px; color: #27427f; }
-    .preview-list { margin: 0; padding-left: 22px; color: #22263a; line-height: 1.7; }
-    .preview-equation { margin: 14px 0; padding: 14px 16px; background: #f4f7ff; border: 1px solid #c5d0ea; color: #17294f; overflow-x: auto; white-space: pre-wrap; }
-    .preview-cite, .preview-ref { color: #214e9d; font-weight: 700; }
-    .preview-underline { text-decoration: underline; }
-    .preview-toc { padding: 10px 12px; background: #f7f9ff; border: 1px dashed #9eb0db; color: #4a5a7f; }
-    .preview-figure img { display: block; width: 100%; max-height: 320px; object-fit: contain; margin-top: 10px; border: 1px solid #d8d3c1; background: #ffffff; }
-    .preview-figure figcaption { margin-top: 8px; color: #5a5f78; font-size: 0.88rem; }
-    .paper-preview-deck.is-twocolumn .paper-page-body { column-count: 2; column-gap: 32px; }
-    @page { size: letter; margin: 0.45in; }
-    @media print { body { background: #fff; } .paper-preview { padding: 0; } .paper-sheet { box-shadow: none; width: auto; min-height: auto; break-after: page; } .paper-sheet:last-child { break-after: auto; } }
-  </style>
-</head>
-<body>
-  <div class="paper-preview">${previewMarkup}</div>
-  <script>
-    window.addEventListener("load", () => {
-      window.print();
-      window.setTimeout(() => window.close(), 150);
-    });
-  <\/script>
-</body>
-</html>`);
-  exportWindow.document.close();
-  elements.lastDiffStatus.textContent = "pdf export opened";
+  elements.lastDiffStatus.textContent = compileInFlight ? "compile in progress" : "compile failed";
 }
 
 function loadSnapshots() {
@@ -1513,9 +1580,11 @@ function applyRemotePaper(content) {
   drafterSettings.paper = content;
   setEditorText(content);
   persistSettings();
-  renderPreview();
+  if (!latestCompiledPdfUrl) {
+    renderPreview();
+  }
   updateEditorStats();
-  updateCompileLogForPaper();
+  scheduleCompile("remote-sync");
   remoteApplyInProgress = false;
 }
 
@@ -1899,8 +1968,32 @@ function buildPreviewStyleClasses(documentClass, packages) {
   return classNames.join(" ");
 }
 
+function stripLatexComments(source) {
+  return String(source || "")
+    .split(/\r?\n/)
+    .map((line) => stripLatexCommentLine(line))
+    .join("\n");
+}
+
+function stripLatexCommentLine(line) {
+  let escaped = false;
+  let output = "";
+  for (const character of String(line || "")) {
+    if (character === "%" && !escaped) {
+      break;
+    }
+    output += character;
+    if (character === "\\") {
+      escaped = !escaped;
+    } else {
+      escaped = false;
+    }
+  }
+  return output;
+}
+
 function cleanLatexText(value) {
-  return String(value || "")
+  return stripLatexComments(value)
     .replace(/\\subsection\{([^}]*)\}/g, "$1")
     .replace(/\\textbf\{([^}]*)\}/g, "$1")
     .replace(/\\emph\{([^}]*)\}/g, "$1")
@@ -2117,7 +2210,28 @@ function paginatePreviewBlocks(blocks) {
   return pages;
 }
 
+function normalizeAgentDiff(rawDiff) {
+  let text = String(rawDiff || "").trim();
+  if (!text) {
+    return "";
+  }
+  const fencedMatches = [...text.matchAll(/```(?:diff|patch)?\s*([\s\S]*?)```/gi)];
+  if (fencedMatches.length) {
+    const withHunks = fencedMatches.find((match) => String(match[1] || "").includes("@@"));
+    text = (withHunks?.[1] || fencedMatches[0]?.[1] || "").trim();
+  }
+  return text.trim();
+}
+
 function applyUnifiedDiff(originalText, diffText) {
+  const strict = applyUnifiedDiffStrict(originalText, diffText);
+  if (strict) {
+    return strict;
+  }
+  return applyUnifiedDiffLenient(originalText, diffText);
+}
+
+function applyUnifiedDiffStrict(originalText, diffText) {
   if (!diffText.trim()) {
     return "";
   }
@@ -2146,6 +2260,9 @@ function applyUnifiedDiff(originalText, diffText) {
   let sourceIndex = 0;
   for (const hunk of hunks) {
     const targetIndex = Math.max(0, hunk.oldStart - 1);
+    if (targetIndex < sourceIndex) {
+      return "";
+    }
     while (sourceIndex < targetIndex) {
       output.push(sourceLines[sourceIndex]);
       sourceIndex += 1;
@@ -2158,10 +2275,77 @@ function applyUnifiedDiff(originalText, diffText) {
       const prefix = line[0];
       const content = line.slice(1);
       if (prefix === " ") {
+        if (sourceLines[sourceIndex] !== content) {
+          return "";
+        }
         output.push(content);
         sourceIndex += 1;
       } else if (prefix === "-") {
+        if (sourceLines[sourceIndex] !== content) {
+          return "";
+        }
         sourceIndex += 1;
+      } else if (prefix === "+") {
+        output.push(content);
+      }
+    }
+  }
+  while (sourceIndex < sourceLines.length) {
+    output.push(sourceLines[sourceIndex]);
+    sourceIndex += 1;
+  }
+  return output.join("\n");
+}
+
+function applyUnifiedDiffLenient(originalText, diffText) {
+  if (!diffText.trim()) {
+    return "";
+  }
+  const lines = diffText.split(/\r?\n/);
+  const hunks = [];
+  let currentHunk = null;
+  for (const line of lines) {
+    if (line.startsWith("@@")) {
+      const match = line.match(/^@@ -(\d+),?(\d*) \+(\d+),?(\d*) @@/);
+      if (!match) {
+        continue;
+      }
+      currentHunk = { oldStart: Number(match[1]), oldCount: Number(match[2] || "1"), newStart: Number(match[3]), newCount: Number(match[4] || "1"), lines: [] };
+      hunks.push(currentHunk);
+      continue;
+    }
+    if (currentHunk && (/^[ +-]/.test(line) || line === "\\ No newline at end of file")) {
+      currentHunk.lines.push(line);
+    }
+  }
+  if (!hunks.length) {
+    return "";
+  }
+  const sourceLines = originalText.split("\n");
+  const output = [];
+  let sourceIndex = 0;
+  for (const hunk of hunks) {
+    const targetIndex = Math.max(sourceIndex, hunk.oldStart - 1);
+    while (sourceIndex < targetIndex && sourceIndex < sourceLines.length) {
+      output.push(sourceLines[sourceIndex]);
+      sourceIndex += 1;
+    }
+    for (const line of hunk.lines) {
+      if (!line) {
+        output.push("");
+        continue;
+      }
+      const prefix = line[0];
+      const content = line.slice(1);
+      if (prefix === " ") {
+        output.push(content);
+        if (sourceIndex < sourceLines.length) {
+          sourceIndex += 1;
+        }
+      } else if (prefix === "-") {
+        if (sourceIndex < sourceLines.length) {
+          sourceIndex += 1;
+        }
       } else if (prefix === "+") {
         output.push(content);
       }

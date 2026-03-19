@@ -4,14 +4,18 @@ import asyncio
 import time
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import AsyncIterator, Callable, Iterable
+from typing import Any, AsyncIterator, Callable, Iterable
 
 try:
     from anthropic import AsyncAnthropic
 except Exception:  # pragma: no cover - optional dependency fallback
     AsyncAnthropic = None  # type: ignore[assignment]
-from google import genai
-from google.genai import types
+try:
+    from google import genai
+    from google.genai import types
+except Exception:  # pragma: no cover - optional dependency fallback
+    genai = None  # type: ignore[assignment]
+    types = None  # type: ignore[assignment]
 from openai import AsyncOpenAI
 
 from .config import ModelDefinition, get_model_map, get_settings
@@ -76,6 +80,7 @@ def openai_style_messages(messages: list[ChatMessage]) -> list[dict[str, str]]:
 
 
 def gemini_contents(messages: list[ChatMessage]) -> tuple[str | None, list[types.Content]]:
+    _require_gemini_sdk()
     system_messages = [message.content for message in messages if message.role == "system"]
     contents = [
         types.Content(
@@ -90,6 +95,110 @@ def gemini_contents(messages: list[ChatMessage]) -> tuple[str | None, list[types
 
 def provider_options(request: ChatCompletionRequest) -> dict:
     return request.provider_options if isinstance(request.provider_options, dict) else {}
+
+
+def _extract_text_from_gemini_response(response: Any) -> str:
+    try:
+        text = getattr(response, "text", None)
+    except Exception:
+        text = None
+    if isinstance(text, str):
+        if text:
+            return text
+    elif text is not None:
+        rendered = str(text)
+        if rendered:
+            return rendered
+
+    candidates = getattr(response, "candidates", None)
+    if candidates is None and isinstance(response, dict):
+        candidates = response.get("candidates")
+
+    text_parts: list[str] = []
+    for candidate in candidates or []:
+        content = getattr(candidate, "content", None)
+        if content is None and isinstance(candidate, dict):
+            content = candidate.get("content")
+
+        parts = getattr(content, "parts", None) if content is not None else None
+        if parts is None and isinstance(content, dict):
+            parts = content.get("parts")
+
+        for part in parts or []:
+            part_text = getattr(part, "text", None)
+            if part_text is None and isinstance(part, dict):
+                part_text = part.get("text")
+            if isinstance(part_text, str):
+                if part_text:
+                    text_parts.append(part_text)
+            elif part_text is not None:
+                rendered_part = str(part_text)
+                if rendered_part:
+                    text_parts.append(rendered_part)
+    return "".join(text_parts)
+
+
+def _gemini_empty_response_reason(response: Any) -> str:
+    prompt_feedback = getattr(response, "prompt_feedback", None)
+    if prompt_feedback is not None:
+        block_reason = getattr(prompt_feedback, "block_reason", None)
+        if block_reason:
+            return f"prompt blocked ({block_reason})"
+
+    candidates = getattr(response, "candidates", None)
+    if candidates is None and isinstance(response, dict):
+        candidates = response.get("candidates")
+    if not candidates:
+        return "no candidates returned"
+
+    finish_reasons: list[str] = []
+    for candidate in candidates:
+        finish_reason = getattr(candidate, "finish_reason", None)
+        if finish_reason is None and isinstance(candidate, dict):
+            finish_reason = candidate.get("finish_reason")
+        rendered = str(finish_reason or "").strip()
+        if rendered:
+            finish_reasons.append(rendered)
+    finish_reasons = [reason for reason in finish_reasons if reason]
+    if finish_reasons:
+        return f"finish_reason={','.join(finish_reasons)}"
+    return "candidate parts contained no text"
+
+
+def _build_gemini_thinking_config(options: dict, fallback_budget: int | None = None) -> Any | None:
+    budget_raw = options.get("thinking_budget", fallback_budget)
+    include_thoughts_raw = options.get("include_thoughts")
+
+    payload: dict[str, Any] = {}
+    if budget_raw is not None:
+        try:
+            payload["thinking_budget"] = int(budget_raw)
+        except (TypeError, ValueError):
+            pass
+    if include_thoughts_raw is not None:
+        payload["include_thoughts"] = bool(include_thoughts_raw)
+
+    if not payload:
+        return None
+    return types.ThinkingConfig(**payload)
+
+
+def _gemini_generate_config(
+    *,
+    system_instruction: str | None,
+    temperature: float | None,
+    max_tokens: int | None,
+    options: dict,
+    fallback_thinking_budget: int | None = None,
+) -> Any:
+    return types.GenerateContentConfig(
+        system_instruction=system_instruction,
+        temperature=temperature,
+        max_output_tokens=max_tokens,
+        top_k=options.get("top_k"),
+        top_p=options.get("top_p"),
+        thinking_config=_build_gemini_thinking_config(options, fallback_budget=fallback_thinking_budget),
+    )
 
 
 def _openai_base_url_for_ollama() -> str:
@@ -121,7 +230,8 @@ def _openai_client() -> AsyncOpenAI:
 
 
 @lru_cache(maxsize=1)
-def _gemini_client() -> genai.Client:
+def _gemini_client() -> Any:
+    _require_gemini_sdk()
     settings = get_settings()
     return genai.Client(api_key=settings.gemini_api_key)
 
@@ -147,6 +257,11 @@ def _require_provider_key(provider: str) -> None:
         raise ProviderError("OPENAI_API_KEY is missing in .env")
     if provider == "anthropic" and not settings.anthropic_api_key:
         raise ProviderError("ANTHROPIC_API_KEY is missing in .env")
+
+
+def _require_gemini_sdk() -> None:
+    if genai is None or types is None:
+        raise ProviderError("Gemini support requires the 'google-genai' package. Run dependency sync/install.")
 
 
 async def stream_text(request: ChatCompletionRequest, resolved: ResolvedModel) -> AsyncIterator[str]:
@@ -257,12 +372,11 @@ async def _stream_gemini(request: ChatCompletionRequest, resolved: ResolvedModel
     _require_provider_key("gemini")
     system_instruction, contents = gemini_contents(request.messages)
     options = provider_options(request)
-    config = types.GenerateContentConfig(
+    config = _gemini_generate_config(
         system_instruction=system_instruction,
         temperature=request.temperature,
-        max_output_tokens=request.max_tokens,
-        top_k=options.get("top_k"),
-        top_p=options.get("top_p"),
+        max_tokens=request.max_tokens,
+        options=options,
     )
 
     def factory() -> Iterable[str]:
@@ -272,8 +386,9 @@ async def _stream_gemini(request: ChatCompletionRequest, resolved: ResolvedModel
             config=config,
         )
         for chunk in stream:
-            if chunk.text:
-                yield chunk.text
+            text = _extract_text_from_gemini_response(chunk)
+            if text:
+                yield text
 
     async for chunk in _iterate_blocking_stream(factory):
         yield chunk
@@ -283,12 +398,11 @@ async def _complete_gemini(request: ChatCompletionRequest, resolved: ResolvedMod
     _require_provider_key("gemini")
     system_instruction, contents = gemini_contents(request.messages)
     options = provider_options(request)
-    config = types.GenerateContentConfig(
+    config = _gemini_generate_config(
         system_instruction=system_instruction,
         temperature=request.temperature,
-        max_output_tokens=request.max_tokens,
-        top_k=options.get("top_k"),
-        top_p=options.get("top_p"),
+        max_tokens=request.max_tokens,
+        options=options,
     )
 
     def run_completion() -> str:
@@ -297,9 +411,49 @@ async def _complete_gemini(request: ChatCompletionRequest, resolved: ResolvedMod
             contents=contents,
             config=config,
         )
-        return response.text or ""
+        text = _extract_text_from_gemini_response(response)
+        if text:
+            return text
 
-    return await asyncio.to_thread(run_completion)
+        reason = _gemini_empty_response_reason(response)
+        if "MAX_TOKENS" in reason:
+            retry_config = _gemini_generate_config(
+                system_instruction=system_instruction,
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+                options=options,
+                fallback_thinking_budget=128,
+            )
+            retry_response = _gemini_client().models.generate_content(
+                model=resolved.upstream_model,
+                contents=contents,
+                config=retry_config,
+            )
+            retry_text = _extract_text_from_gemini_response(retry_response)
+            if retry_text:
+                return retry_text
+
+        # Some google-genai responses can expose no top-level text in non-stream mode.
+        stream = _gemini_client().models.generate_content_stream(
+            model=resolved.upstream_model,
+            contents=contents,
+            config=config,
+        )
+        stream_chunks: list[str] = []
+        for chunk in stream:
+            chunk_text = _extract_text_from_gemini_response(chunk)
+            if chunk_text:
+                stream_chunks.append(chunk_text)
+        stream_text = "".join(stream_chunks)
+        if stream_text:
+            return stream_text
+
+        raise ProviderError(f"Gemini returned an empty response ({reason}).")
+
+    try:
+        return await asyncio.to_thread(run_completion)
+    except Exception as exc:  # pragma: no cover - network/provider failure path
+        raise ProviderError(str(exc)) from exc
 
 
 def anthropic_messages(messages: list[ChatMessage]) -> tuple[str | None, list[dict[str, str]]]:

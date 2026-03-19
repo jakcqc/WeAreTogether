@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from datetime import datetime, timezone
 import ipaddress
 import json
 import re
 import secrets
+import shutil
+import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -44,8 +48,13 @@ ROOM_CHAT_ATTACHMENT_NAME_MAX_CHARS = 160
 DRAFT_CHAT_HISTORY_LIMIT = 80
 DRAFTER_TEXT_ASSET_LIMIT = 250_000
 DRAFTER_IMAGE_ASSET_LIMIT = 3_500_000
+LLM_RESPONSE_LOG_PATH = BASE_DIR / "llm_responses.jsonl"
 DRAFTER_ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
 DRAFTER_ALLOWED_TEXT_EXTENSIONS = {".bib", ".tex"}
+DRAFTER_COMPILES_DIR = DOWNLOADS_DIR / "drafter_compiles"
+DRAFTER_COMPILE_TIMEOUT_SECONDS = 45
+DRAFTER_COMPILE_LOG_CHAR_LIMIT = 24_000
+DRAFTER_COMPILE_HISTORY_LIMIT = 20
 ROOM_UPLOADS_DIR = STATIC_DIR / "room_uploads"
 ROOM_AI_SYSTEM_PROMPT = (
     "You are a participant-owned AI assistant inside a small multi-user chat room. "
@@ -55,6 +64,8 @@ ROOM_AI_SYSTEM_PROMPT = (
 
 app = FastAPI(title="Local Chat", version="0.1.0")
 DRAFTER_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+DRAFTER_COMPILES_DIR.mkdir(parents=True, exist_ok=True)
 ROOM_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/assets", StaticFiles(directory=STATIC_DIR), name="assets")
 app.mount("/downloads", StaticFiles(directory=DOWNLOADS_DIR), name="downloads")
@@ -77,6 +88,18 @@ class NoCacheMiddleware(BaseHTTPMiddleware):
 
 
 app.add_middleware(NoCacheMiddleware)
+llm_response_log_lock = asyncio.Lock()
+
+
+def provider_error_status_code(message: str) -> int:
+    normalized = message.lower()
+    if "429" in message or "resource_exhausted" in normalized or "quota" in normalized or "rate limit" in normalized:
+        return status.HTTP_429_TOO_MANY_REQUESTS
+    if "401" in message or "unauthorized" in normalized or "invalid api key" in normalized:
+        return status.HTTP_401_UNAUTHORIZED
+    if "403" in message or "forbidden" in normalized:
+        return status.HTTP_403_FORBIDDEN
+    return status.HTTP_400_BAD_REQUEST
 
 
 @dataclass
@@ -622,6 +645,21 @@ async def delete_drafter_asset(request: Request, asset_name: str) -> dict[str, s
     return {"status": "deleted", "name": normalized_name}
 
 
+@app.post("/api/drafter/compile")
+async def compile_drafter_paper(request: Request, payload: dict[str, Any]) -> dict[str, Any]:
+    if not collaboration_client_allowed(request):
+        raise HTTPException(
+            status_code=403,
+            detail="Collaboration is limited to localhost or allowlisted client IPs.",
+        )
+    source = normalize_draft_content(payload.get("content"))
+    if not source.strip():
+        raise HTTPException(status_code=400, detail="Draft content is empty.")
+    prefer_engine = str(payload.get("engine") or "").strip().lower()
+    compile_result = await asyncio.to_thread(run_drafter_latex_compile, source, prefer_engine)
+    return compile_result
+
+
 @app.post("/api/rooms/{room_name}/attachments")
 async def upload_room_attachments(
     request: Request,
@@ -672,6 +710,52 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/provider-health/google")
+async def google_provider_health(model: str = "gemini:gemini-2.5-flash") -> dict[str, Any]:
+    started_at = int(time.time() * 1000)
+    settings = get_settings()
+    if not settings.gemini_api_key:
+        return {
+            "provider": "google",
+            "status": "not_configured",
+            "model": model,
+            "checkedAt": started_at,
+            "detail": "GEMINI_API_KEY is missing in .env",
+        }
+
+    try:
+        resolved = resolve_model(model)
+        if resolved.provider != "gemini":
+            raise ProviderError("Requested model is not a Gemini model.")
+        probe_request = ChatCompletionRequest(
+            model=model,
+            stream=False,
+            temperature=0.0,
+            max_tokens=24,
+            messages=[ChatMessage(role="user", content="Reply with exactly: OK")],
+        )
+        text = await asyncio.wait_for(complete_text(probe_request, resolved), timeout=20)
+        duration_ms = int(time.time() * 1000) - started_at
+        return {
+            "provider": "google",
+            "status": "ok",
+            "model": model,
+            "checkedAt": started_at,
+            "durationMs": duration_ms,
+            "responsePreview": _truncate_for_log(text, 180),
+        }
+    except Exception as exc:  # pragma: no cover - network/provider failure path
+        duration_ms = int(time.time() * 1000) - started_at
+        return {
+            "provider": "google",
+            "status": "error",
+            "model": model,
+            "checkedAt": started_at,
+            "durationMs": duration_ms,
+            "detail": str(exc),
+        }
+
+
 @app.get("/api/models", response_model=list[ModelResponse])
 async def api_models() -> list[ModelResponse]:
     return [
@@ -716,19 +800,34 @@ async def chat_completions(request: ChatCompletionRequest):
     try:
         resolved = resolve_model(request.model)
     except ProviderError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=provider_error_status_code(str(exc)), detail=str(exc)) from exc
 
     completion_id = f"chatcmpl_{secrets.token_hex(12)}"
 
     if request.stream:
         async def event_stream():
+            chunks: list[str] = []
             try:
                 yield _sse(stream_chunk(request.model, completion_id))
                 async for text in stream_text(request, resolved):
+                    chunks.append(text)
                     yield _sse(stream_chunk(request.model, completion_id, text))
+                await append_llm_response_log(
+                    completion_id=completion_id,
+                    request=request,
+                    resolved=resolved,
+                    response_text="".join(chunks),
+                )
                 yield _sse(stream_chunk(request.model, completion_id, done=True))
                 yield "data: [DONE]\n\n"
             except ProviderError as exc:
+                await append_llm_response_log(
+                    completion_id=completion_id,
+                    request=request,
+                    resolved=resolved,
+                    response_text="".join(chunks),
+                    error=str(exc),
+                )
                 error_chunk = {
                     "error": {
                         "message": str(exc),
@@ -743,8 +842,21 @@ async def chat_completions(request: ChatCompletionRequest):
     try:
         text = await complete_text(request, resolved)
     except ProviderError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        await append_llm_response_log(
+            completion_id=completion_id,
+            request=request,
+            resolved=resolved,
+            response_text="",
+            error=str(exc),
+        )
+        raise HTTPException(status_code=provider_error_status_code(str(exc)), detail=str(exc)) from exc
 
+    await append_llm_response_log(
+        completion_id=completion_id,
+        request=request,
+        resolved=resolved,
+        response_text=text,
+    )
     return JSONResponse(completion_payload(request.model, completion_id, text))
 
 
@@ -1130,6 +1242,62 @@ def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
+def _truncate_for_log(value: Any, limit: int = 1800) -> str:
+    text = str(value or "")
+    if len(text) <= limit:
+        return text
+    remaining = len(text) - limit
+    return f"{text[:limit]}...[truncated {remaining} chars]"
+
+
+def build_request_log_messages(messages: list[ChatMessage]) -> list[dict[str, str]]:
+    recent = messages[-24:] if len(messages) > 24 else messages
+    return [
+        {
+            "role": message.role,
+            "content": _truncate_for_log(message.content),
+        }
+        for message in recent
+    ]
+
+
+async def append_llm_response_log(
+    *,
+    completion_id: str,
+    request: ChatCompletionRequest,
+    resolved: Any,
+    response_text: str,
+    error: str = "",
+) -> None:
+    entry = {
+        "timestampMs": int(time.time() * 1000),
+        "timestampUtc": datetime.now(timezone.utc).isoformat(),
+        "completionId": completion_id,
+        "provider": getattr(resolved, "provider", ""),
+        "model": request.model,
+        "upstreamModel": getattr(resolved, "upstream_model", ""),
+        "stream": bool(request.stream),
+        "temperature": request.temperature,
+        "maxTokens": request.max_tokens,
+        "messageCount": len(request.messages),
+        "messages": build_request_log_messages(request.messages),
+        "response": {
+            "content": response_text,
+            "chars": len(response_text),
+        },
+        "success": not bool(error),
+        "error": error,
+    }
+    serialized = json.dumps(entry, ensure_ascii=False)
+    async with llm_response_log_lock:
+        try:
+            with LLM_RESPONSE_LOG_PATH.open("a", encoding="utf-8") as file_handle:
+                file_handle.write(serialized)
+                file_handle.write("\n")
+        except OSError:
+            return
+
+
 def connection_host(connection: Request | WebSocket) -> str:
     forwarded = connection.headers.get("x-forwarded-for", "").strip()
     if forwarded:
@@ -1335,6 +1503,236 @@ async def write_upload_to_disk(upload: UploadFile, destination: Path, *, max_byt
     finally:
         await upload.close()
     return total
+
+
+def _truncate_compile_log(text: str, *, limit: int = DRAFTER_COMPILE_LOG_CHAR_LIMIT) -> str:
+    if len(text) <= limit:
+        return text
+    overflow = len(text) - limit
+    return f"{text[:limit]}\n...[truncated {overflow} chars]"
+
+
+def _detect_latex_compilers(prefer_engine: str = "") -> list[tuple[str, str]]:
+    available: list[tuple[str, str]] = []
+    for engine_name, binary_name in (("tectonic", "tectonic"), ("latexmk", "latexmk"), ("pdflatex", "pdflatex")):
+        binary = shutil.which(binary_name)
+        if binary:
+            available.append((engine_name, binary))
+    if not prefer_engine:
+        return available
+    preferred = [item for item in available if item[0] == prefer_engine]
+    remainder = [item for item in available if item[0] != prefer_engine]
+    return preferred + remainder
+
+
+def _run_compile_command(
+    command: list[str],
+    *,
+    cwd: Path,
+    timeout_seconds: int = DRAFTER_COMPILE_TIMEOUT_SECONDS,
+) -> tuple[int, str]:
+    display = " ".join(command)
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(cwd),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+        output = f"$ {display}\n{completed.stdout}{completed.stderr}".strip()
+        return completed.returncode, output
+    except subprocess.TimeoutExpired as exc:
+        timeout_output = f"{str(exc.stdout or '')}{str(exc.stderr or '')}"
+        return 124, f"$ {display}\n{timeout_output}\n[error] compile timed out after {timeout_seconds}s".strip()
+    except OSError as exc:
+        return 127, f"$ {display}\n[error] could not execute compiler: {exc}".strip()
+
+
+def _copy_drafter_assets_for_compile(work_dir: Path) -> None:
+    uploads_dir = work_dir / "drafter_uploads"
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    for source in DRAFTER_ASSETS_DIR.iterdir():
+        if not source.is_file() or not drafter_asset_kind(source.name):
+            continue
+        target = uploads_dir / source.name
+        shutil.copy2(source, target)
+        # Also copy text assets into the workspace root for plain \input{file} and \bibliography{file}.
+        if source.suffix.lower() in {".tex", ".bib"}:
+            shutil.copy2(source, work_dir / source.name)
+
+
+def _aux_requests_bibtex(aux_path: Path) -> bool:
+    if not aux_path.exists():
+        return False
+    content = aux_path.read_text(encoding="utf-8", errors="ignore")
+    return "\\citation" in content or "\\bibdata" in content
+
+
+def _extract_latex_log(work_dir: Path) -> str:
+    log_path = work_dir / "main.log"
+    if not log_path.exists():
+        return ""
+    return log_path.read_text(encoding="utf-8", errors="replace")
+
+
+def _cleanup_old_drafter_compiles() -> None:
+    compile_dirs = [path for path in DRAFTER_COMPILES_DIR.iterdir() if path.is_dir()]
+    if len(compile_dirs) <= DRAFTER_COMPILE_HISTORY_LIMIT:
+        return
+    compile_dirs.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    for stale in compile_dirs[DRAFTER_COMPILE_HISTORY_LIMIT:]:
+        shutil.rmtree(stale, ignore_errors=True)
+
+
+def run_drafter_latex_compile(source: str, prefer_engine: str = "") -> dict[str, Any]:
+    started = int(time.time() * 1000)
+    supported = {"", "tectonic", "latexmk", "pdflatex"}
+    normalized_preference = prefer_engine if prefer_engine in supported else ""
+    compilers = _detect_latex_compilers(normalized_preference)
+    if not compilers:
+        return {
+            "success": False,
+            "status": "error",
+            "compiler": "",
+            "pdfUrl": "",
+            "compiledAt": started,
+            "durationMs": 0,
+            "log": (
+                "[error] No LaTeX compiler is installed.\n"
+                "Install one of: tectonic, latexmk (with TeX Live/MacTeX), or pdflatex."
+            ),
+        }
+
+    with tempfile.TemporaryDirectory(prefix="drafter-compile-") as temp_dir:
+        work_dir = Path(temp_dir)
+        main_path = work_dir / "main.tex"
+        main_path.write_text(source, encoding="utf-8")
+        _copy_drafter_assets_for_compile(work_dir)
+
+        selected_engine = compilers[0][0]
+        selected_binary = compilers[0][1]
+        log_sections: list[str] = [f"[compile] engine={selected_engine}"]
+
+        if selected_engine == "tectonic":
+            exit_code, output = _run_compile_command(
+                [
+                    selected_binary,
+                    "--keep-logs",
+                    "--keep-intermediates",
+                    "--outdir",
+                    str(work_dir),
+                    "main.tex",
+                ],
+                cwd=work_dir,
+            )
+            log_sections.append(output)
+        elif selected_engine == "latexmk":
+            exit_code, output = _run_compile_command(
+                [
+                    selected_binary,
+                    "-pdf",
+                    "-interaction=nonstopmode",
+                    "-halt-on-error",
+                    "-file-line-error",
+                    "main.tex",
+                ],
+                cwd=work_dir,
+            )
+            log_sections.append(output)
+        else:
+            pass1_code, pass1_output = _run_compile_command(
+                [
+                    selected_binary,
+                    "-interaction=nonstopmode",
+                    "-halt-on-error",
+                    "-file-line-error",
+                    "main.tex",
+                ],
+                cwd=work_dir,
+            )
+            log_sections.append("[pdflatex] pass 1")
+            log_sections.append(pass1_output)
+            exit_code = pass1_code
+
+            if pass1_code == 0 and shutil.which("bibtex") and _aux_requests_bibtex(work_dir / "main.aux"):
+                bibtex_code, bibtex_output = _run_compile_command(["bibtex", "main"], cwd=work_dir)
+                log_sections.append("[bibtex]")
+                log_sections.append(bibtex_output)
+                exit_code = bibtex_code if bibtex_code != 0 else exit_code
+
+            if exit_code == 0:
+                pass2_code, pass2_output = _run_compile_command(
+                    [
+                        selected_binary,
+                        "-interaction=nonstopmode",
+                        "-halt-on-error",
+                        "-file-line-error",
+                        "main.tex",
+                    ],
+                    cwd=work_dir,
+                )
+                log_sections.append("[pdflatex] pass 2")
+                log_sections.append(pass2_output)
+                exit_code = pass2_code
+
+            if exit_code == 0:
+                pass3_code, pass3_output = _run_compile_command(
+                    [
+                        selected_binary,
+                        "-interaction=nonstopmode",
+                        "-halt-on-error",
+                        "-file-line-error",
+                        "main.tex",
+                    ],
+                    cwd=work_dir,
+                )
+                log_sections.append("[pdflatex] pass 3")
+                log_sections.append(pass3_output)
+                exit_code = pass3_code
+
+        main_pdf = work_dir / "main.pdf"
+        latex_log = _extract_latex_log(work_dir)
+        if latex_log:
+            log_sections.append("[main.log]")
+            log_sections.append(latex_log)
+
+        compile_log = _truncate_compile_log("\n\n".join(section for section in log_sections if section))
+        duration_ms = int(time.time() * 1000) - started
+        succeeded = exit_code == 0 and main_pdf.exists() and main_pdf.stat().st_size > 0
+
+        if not succeeded:
+            return {
+                "success": False,
+                "status": "error",
+                "compiler": selected_engine,
+                "pdfUrl": "",
+                "compiledAt": int(time.time() * 1000),
+                "durationMs": duration_ms,
+                "log": compile_log or f"[error] compile failed with exit code {exit_code}",
+            }
+
+        compile_id = f"{int(time.time() * 1000)}-{secrets.token_hex(5)}"
+        output_dir = DRAFTER_COMPILES_DIR / compile_id
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_pdf = output_dir / "main.pdf"
+        shutil.copy2(main_pdf, output_pdf)
+        (output_dir / "compile.log").write_text(compile_log, encoding="utf-8")
+        _cleanup_old_drafter_compiles()
+
+        status_label = "warn" if re.search(r"\bwarning\b", compile_log, flags=re.IGNORECASE) else "clean"
+        return {
+            "success": True,
+            "status": status_label,
+            "compiler": selected_engine,
+            "pdfUrl": f"/downloads/drafter_compiles/{compile_id}/main.pdf",
+            "compiledAt": int(time.time() * 1000),
+            "durationMs": duration_ms,
+            "log": compile_log,
+        }
 
 
 def normalize_draft_content(value: Any) -> str:

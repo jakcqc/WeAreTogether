@@ -653,6 +653,12 @@ select {
   padding: 0px 12px 0px 0px;
 }
 
+.chat-sidepanel {
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
 .chat-column {
   display: grid;
   grid-template-rows: minmax(0, 1fr) auto;
@@ -672,7 +678,7 @@ select {
 .room-page .history-wrap {
   flex: 0 0 auto;
   min-height: 0;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .room-page .sidebar-top,
@@ -707,6 +713,9 @@ select {
 }
 
 .room-sidepanel {
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
   align-content: start;
 }
 
@@ -1059,6 +1068,18 @@ select {
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.6), rgba(255, 255, 255, 0.3)),
     repeating-linear-gradient(0deg, rgba(0, 43, 135, 0.05) 0, rgba(0, 43, 135, 0.05) 1px, transparent 1px, transparent 28px);
+}
+
+.paper-preview.has-pdf {
+  padding: 10px;
+  background: #f0f3fb;
+}
+
+.paper-preview-frame {
+  width: 100%;
+  min-height: 620px;
+  border: 2px solid #8096c6;
+  background: #fff;
 }
 
 .paper-preview-deck {
@@ -1540,6 +1561,13 @@ select {
   line-height: 1.5;
 }
 
+.compile-toolbar {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-bottom: 10px;
+}
+
 .collaborator-list {
   display: grid;
   gap: 10px;
@@ -1702,6 +1730,12 @@ body.drafter-page .drafter-page-shell {
   min-height: 0;
 }
 
+.drafter-page #agent-explanation {
+  min-height: 220px;
+  max-height: 45vh;
+  resize: vertical;
+}
+
 .asset-upload-input {
   position: absolute;
   width: 1px;
@@ -1768,6 +1802,11 @@ body.drafter-page .drafter-page-shell {
 .drafter-nav-panel {
   margin-top: 0;
   min-height: 0;
+}
+
+.drafter-page .drafter-nav-panel {
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 
 .drafter-nav-panel.active {
@@ -2409,10 +2448,19 @@ button:disabled {
     font-size: clamp(1.6rem, 3vw, 2.4rem);
   }
 
-  .button-row,
   .banner-badges,
   .sidebar-top .pixel-box {
     display: none;
+  }
+
+  .button-row {
+    gap: 6px;
+    margin-top: 8px;
+  }
+
+  .button-row .web-button {
+    padding: 4px 8px;
+    font-size: 0.72rem;
   }
 
   .sidebar-top,
@@ -2432,6 +2480,13 @@ button:disabled {
 
   .history-wrap {
     max-height: 42vh;
+    overflow-y: auto;
+    overflow-x: hidden;
+  }
+
+  .room-page .history-wrap {
+    max-height: none;
+    overflow: visible;
   }
 
   .composer-shell {

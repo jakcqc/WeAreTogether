@@ -254,6 +254,7 @@ Notes:
 - If the server uses HTTPS, the socket uses `wss://`.
 - The host machine must allow the collaborator IP through `COLLAB_ALLOWED_CLIENT_IPS` when remote clients are enabled.
 - `Save Snapshot`, `Download .tex`, and `Export PDF` are available from the left-side `Overview` panel in Drafter.
+- Drafter PDF compile requires a local TeX toolchain on the host machine. LocalChat auto-detects `tectonic`, `latexmk`, or `pdflatex`.
 
 ## Vintage Ad Downloader
 
@@ -289,9 +290,40 @@ Serves the frontend.
 
 Simple health check.
 
+### `GET /api/provider-health/google`
+
+Checks Gemini/Google model connectivity with a lightweight probe.
+
+Example:
+
+```text
+GET /api/provider-health/google?model=gemini:gemini-2.5-flash
+```
+
+Returns status metadata (`ok`, `not_configured`, or `error`) plus timing.
+
 ### `GET /api/models`
 
 Returns model metadata for the frontend.
+
+### `POST /api/drafter/compile`
+
+Compiles Drafter `main.tex` with a real LaTeX compiler and returns a PDF URL + compile log.
+
+Request body:
+
+```json
+{
+  "content": "\\documentclass{article} ...",
+  "engine": "tectonic"
+}
+```
+
+`engine` is optional. When omitted, LocalChat chooses the first available compiler from:
+
+1. `tectonic`
+2. `latexmk`
+3. `pdflatex`
 
 ### `GET /v1/models`
 
@@ -315,6 +347,16 @@ Streaming example:
   ]
 }
 ```
+
+## LLM Response Log
+
+Every completion request now appends a JSON line entry to:
+
+```text
+localchat/localchat/llm_responses.jsonl
+```
+
+Each entry includes timestamp, model/provider, request metadata, response text, and error state.
 
 Non-streaming example:
 
