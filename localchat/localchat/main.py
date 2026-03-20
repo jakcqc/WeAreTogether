@@ -43,11 +43,18 @@ ROOM_STATE_PATH = BASE_DIR / "room_state.json"
 ROOM_HISTORY_LIMIT = 120
 ROOM_CONTEXT_MESSAGE_LIMIT = 18
 ROOM_CONTEXT_CHAR_BUDGET = 16000
+ROOM_CHAT_CONTENT_MAX_CHARS = 8000
+ROOM_SYSTEM_MESSAGE_TTL_MS = 60_000
+ROOM_SYSTEM_CLEANUP_INTERVAL_SECONDS = 1
 ROOM_IMAGE_DATA_URL_MAX_CHARS = 2_000_000
 ROOM_CHAT_ATTACHMENT_NAME_MAX_CHARS = 160
 DRAFT_CHAT_HISTORY_LIMIT = 80
 DRAFTER_TEXT_ASSET_LIMIT = 250_000
 DRAFTER_IMAGE_ASSET_LIMIT = 3_500_000
+HF_TTS_DEFAULT_MODEL = "microsoft/speecht5_tts"
+HF_TTS_TEXT_CHAR_LIMIT = 1200
+HF_TTS_MODEL_MAX_CHARS = 120
+HF_TTS_VOICE_MAX_CHARS = 64
 LLM_RESPONSE_LOG_PATH = BASE_DIR / "llm_responses.jsonl"
 DRAFTER_ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
 DRAFTER_ALLOWED_TEXT_EXTENSIONS = {".bib", ".tex"}
@@ -89,6 +96,23 @@ class NoCacheMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(NoCacheMiddleware)
 llm_response_log_lock = asyncio.Lock()
+
+
+@app.on_event("startup")
+async def startup_room_cleanup() -> None:
+    app.state.room_system_cleanup_task = asyncio.create_task(expire_room_system_messages_loop())
+
+
+@app.on_event("shutdown")
+async def shutdown_room_cleanup() -> None:
+    cleanup_task = getattr(app.state, "room_system_cleanup_task", None)
+    if cleanup_task is None:
+        return
+    cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        return
 
 
 def provider_error_status_code(message: str) -> int:
@@ -142,6 +166,7 @@ class RoomHub:
     async def connect(self, room_name: str, websocket: WebSocket, username: str) -> dict[str, Any]:
         await websocket.accept()
         async with self._lock:
+            self._prune_expired_system_messages_locked()
             room = self._rooms.setdefault(room_name, RoomState())
             room.clients.add(websocket)
             participant_ids = {participant.participant_id for participant in room.participants.values()}
@@ -170,11 +195,13 @@ class RoomHub:
 
     async def snapshot(self, room_name: str) -> list[dict[str, Any]]:
         async with self._lock:
+            self._prune_expired_system_messages_locked()
             room = self._rooms.get(room_name)
             return list(room.history) if room else []
 
     async def append_and_broadcast(self, room_name: str, message: dict[str, Any]) -> None:
         async with self._lock:
+            self._prune_expired_system_messages_locked()
             room = self._rooms.setdefault(room_name, RoomState())
             message.setdefault("reactions", {})
             room.history.append(message)
@@ -252,6 +279,7 @@ class RoomHub:
         username: str,
     ) -> dict[str, dict[str, Any]] | None:
         async with self._lock:
+            self._prune_expired_system_messages_locked()
             room = self._rooms.get(room_name)
             if room is None:
                 return None
@@ -277,6 +305,7 @@ class RoomHub:
 
     async def delete_message(self, room_name: str, message_id: str) -> bool:
         async with self._lock:
+            self._prune_expired_system_messages_locked()
             room = self._rooms.get(room_name)
             if room is None:
                 return False
@@ -286,6 +315,36 @@ class RoomHub:
             if deleted:
                 self._persist_locked()
             return deleted
+
+    async def edit_message(
+        self,
+        room_name: str,
+        *,
+        message_id: str,
+        username: str,
+        content: str,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        async with self._lock:
+            self._prune_expired_system_messages_locked()
+            room = self._rooms.get(room_name)
+            if room is None:
+                return None, "not_found"
+            for message in room.history:
+                if str(message.get("id")) != message_id:
+                    continue
+                if str(message.get("speakerType") or "").lower() != "user":
+                    return None, "forbidden"
+                if str(message.get("sender") or "") != username:
+                    return None, "forbidden"
+                message["content"] = content
+                message["editedAt"] = int(time.time() * 1000)
+                self._persist_locked()
+                return dict(message), None
+        return None, "not_found"
+
+    async def expire_system_messages(self) -> list[tuple[str, str]]:
+        async with self._lock:
+            return self._prune_expired_system_messages_locked()
 
     async def _broadcast_clients(self, room_name: str, clients: list[WebSocket], payload: dict[str, Any]) -> None:
         stale_clients: list[WebSocket] = []
@@ -338,6 +397,11 @@ class RoomHub:
                 continue
             raw_history = room_value.get("history")
             history = [item for item in raw_history if isinstance(item, dict)] if isinstance(raw_history, list) else []
+            history = [
+                item
+                for item in history
+                if not self._is_expired_system_message(item, int(time.time() * 1000))
+            ]
             rooms[normalized_name] = RoomState(
                 history=history[-ROOM_HISTORY_LIMIT:],
                 focus_mode=bool(room_value.get("focusMode", False)),
@@ -359,8 +423,88 @@ class RoomHub:
         except OSError:
             return
 
+    def _prune_expired_system_messages_locked(self, now_ms: int | None = None) -> list[tuple[str, str]]:
+        current_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+        removed: list[tuple[str, str]] = []
+        changed = False
+        empty_rooms: list[str] = []
+
+        for room_name, room in self._rooms.items():
+            filtered_history: list[dict[str, Any]] = []
+            room_changed = False
+            for message in room.history:
+                if self._is_expired_system_message(message, current_ms):
+                    removed.append((room_name, str(message.get("id") or "")))
+                    room_changed = True
+                    continue
+                filtered_history.append(message)
+            if room_changed:
+                room.history = filtered_history
+                changed = True
+            if not room.clients and not room.history:
+                empty_rooms.append(room_name)
+
+        for room_name in empty_rooms:
+            self._rooms.pop(room_name, None)
+
+        if changed or empty_rooms:
+            self._persist_locked()
+        return [(room_name, message_id) for room_name, message_id in removed if message_id]
+
+    def _is_expired_system_message(self, message: dict[str, Any], now_ms: int) -> bool:
+        if str(message.get("speakerType") or "").lower() != "system":
+            return False
+        created_at = self._coerce_int(
+            message.get("createdAt"),
+            default=now_ms,
+            minimum=0,
+            maximum=now_ms + ROOM_SYSTEM_MESSAGE_TTL_MS,
+        )
+        expires_at = self._coerce_int(
+            message.get("expiresAt"),
+            default=created_at + ROOM_SYSTEM_MESSAGE_TTL_MS,
+            minimum=created_at,
+            maximum=created_at + (ROOM_SYSTEM_MESSAGE_TTL_MS * 4),
+        )
+        return expires_at <= now_ms
+
+    @staticmethod
+    def _coerce_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError):
+            numeric = int(default)
+        if numeric < minimum:
+            return minimum
+        if numeric > maximum:
+            return maximum
+        return numeric
+
 
 room_hub = RoomHub()
+
+
+async def expire_room_system_messages_loop() -> None:
+    try:
+        while True:
+            await asyncio.sleep(ROOM_SYSTEM_CLEANUP_INTERVAL_SECONDS)
+            expired_entries = await room_hub.expire_system_messages()
+            if not expired_entries:
+                continue
+            deleted_at = int(time.time() * 1000)
+            for room_name, message_id in expired_entries:
+                await room_hub.broadcast(
+                    room_name,
+                    {
+                        "type": "message_deleted",
+                        "messageId": message_id,
+                        "deletedBy": "system",
+                        "deletedAt": deleted_at,
+                        "reason": "expired",
+                    },
+                )
+    except asyncio.CancelledError:
+        return
 
 
 class DraftHub:
@@ -678,7 +822,6 @@ async def upload_room_attachments(
 
     room_dir = ROOM_UPLOADS_DIR / normalized_room
     room_dir.mkdir(parents=True, exist_ok=True)
-    request_base = str(request.base_url).rstrip("/")
     uploaded: list[dict[str, Any]] = []
 
     for upload in files:
@@ -688,7 +831,7 @@ async def upload_room_attachments(
         size = await write_upload_to_disk(upload, destination, max_bytes=None)
         mime_type = str(upload.content_type or "").strip()[:120]
         attachment_type = room_attachment_type_from_name_or_mime(normalized_name, mime_type)
-        url = f"{request_base}/assets/room_uploads/{quote(normalized_room)}/{quote(stored_name)}"
+        url = f"/assets/room_uploads/{quote(normalized_room)}/{quote(stored_name)}"
         uploaded.append(
             {
                 "type": attachment_type,
@@ -702,6 +845,40 @@ async def upload_room_attachments(
     return {
         "room": normalized_room,
         "attachments": uploaded,
+    }
+
+
+@app.post("/api/rooms/{room_name}/pictochat")
+async def create_room_pictochat(request: Request, room_name: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    if not collaboration_client_allowed(request):
+        raise HTTPException(
+            status_code=403,
+            detail="Room uploads are limited to localhost or allowlisted client IPs.",
+        )
+
+    normalized_room = normalize_room_name(room_name, fallback="lobby")
+    normalized_title = normalize_room_label((payload or {}).get("title") or "Pictochat", fallback="Pictochat")
+    board_id = secrets.token_hex(5)
+    room_dir = ROOM_UPLOADS_DIR / normalized_room
+    room_dir.mkdir(parents=True, exist_ok=True)
+    normalized_name = normalize_room_attachment_name(f"{normalized_title}.pictochat.html")
+    stored_name = f"{int(time.time() * 1000)}-{board_id}-{normalized_name}"
+    destination = room_dir / stored_name
+    html_content = build_pictochat_html(title=normalized_title, board_id=board_id)
+    destination.write_text(html_content, encoding="utf-8")
+    size = destination.stat().st_size
+
+    url = f"/assets/room_uploads/{quote(normalized_room)}/{quote(stored_name)}"
+    attachment = {
+        "type": "file",
+        "name": normalized_name,
+        "url": url,
+        "size": size,
+        "mimeType": "text/html",
+    }
+    return {
+        "room": normalized_room,
+        "attachment": attachment,
     }
 
 
@@ -777,6 +954,43 @@ async def api_models() -> list[ModelResponse]:
 async def client_runtime() -> dict[str, str]:
     settings = get_settings()
     return {"ollamaBaseUrl": settings.ollama_base_url}
+
+
+@app.post("/api/tts/huggingface")
+async def huggingface_tts(request: Request, payload: dict[str, Any]) -> StreamingResponse:
+    if not collaboration_client_allowed(request):
+        raise HTTPException(
+            status_code=403,
+            detail="Voice reader requests are limited to localhost or allowlisted client IPs.",
+        )
+
+    settings = get_settings()
+    if not settings.huggingface_api_key:
+        raise HTTPException(status_code=400, detail="HUGGINGFACE_API_KEY is required for voice reader.")
+
+    text = normalize_hf_tts_text(payload.get("text"))
+    if not text:
+        raise HTTPException(status_code=400, detail="Voice reader text is empty.")
+
+    model_id = normalize_hf_tts_model(payload.get("modelId"))
+    voice = normalize_hf_tts_voice(payload.get("voice"))
+
+    try:
+        audio_bytes, media_type = await asyncio.to_thread(
+            request_huggingface_tts_audio,
+            api_key=settings.huggingface_api_key,
+            model_id=model_id,
+            text=text,
+            voice=voice,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return StreamingResponse(
+        iter([audio_bytes]),
+        media_type=media_type,
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+    )
 
 
 @app.get("/v1/models")
@@ -959,6 +1173,47 @@ async def room_socket(websocket: WebSocket, room_name: str) -> None:
                 )
                 continue
 
+            if event_type == "edit_message":
+                message_id = str(payload.get("messageId") or "").strip()
+                content = normalize_room_message_content(payload.get("content"))
+                if not message_id:
+                    continue
+                if not content:
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "detail": "Message content cannot be empty.",
+                        }
+                    )
+                    continue
+                updated_message, edit_error = await room_hub.edit_message(
+                    normalized_room,
+                    message_id=message_id,
+                    username=username,
+                    content=content,
+                )
+                if edit_error == "forbidden":
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "detail": "You can only edit your own user messages.",
+                        }
+                    )
+                    continue
+                if updated_message is None:
+                    continue
+                await room_hub.broadcast(
+                    normalized_room,
+                    {
+                        "type": "message_edited",
+                        "messageId": message_id,
+                        "content": str(updated_message.get("content") or ""),
+                        "editedBy": username,
+                        "editedAt": int(updated_message.get("editedAt") or int(time.time() * 1000)),
+                    },
+                )
+                continue
+
             if event_type == "focus_mode":
                 enabled = bool(payload.get("enabled"))
                 changed = await room_hub.set_focus_mode(normalized_room, enabled)
@@ -1061,7 +1316,7 @@ async def room_socket(websocket: WebSocket, room_name: str) -> None:
                 continue
 
             message_type = str(payload.get("messageType") or "text").strip().lower()
-            content = str(payload.get("content") or "").strip()
+            content = normalize_room_message_content(payload.get("content"))
             image_data_url = normalize_room_image_data_url(payload.get("imageData"))
             image_name = normalize_room_image_name(payload.get("imageName"))
             attachments = normalize_room_chat_attachments(payload.get("attachments"))
@@ -1086,6 +1341,16 @@ async def room_socket(websocket: WebSocket, room_name: str) -> None:
             temperature = clamp_float(payload.get("temperature"), default=0.7, minimum=0.0, maximum=2.0)
             max_tokens = clamp_int(payload.get("maxTokens"), default=512, minimum=64, maximum=4096)
             provider_options = payload.get("providerOptions") if isinstance(payload.get("providerOptions"), dict) else {}
+            fallback_route = {
+                "trigger": "ai",
+                "agent_name": agent_name,
+                "system_prompt": system_prompt,
+                "model_id": model_id,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "provider_options": provider_options,
+                "context_mode": "room",
+            }
 
             user_message = build_room_event(
                 event_type="chat",
@@ -1102,18 +1367,27 @@ async def room_socket(websocket: WebSocket, room_name: str) -> None:
             )
             await room_hub.append_and_broadcast(normalized_room, user_message)
 
-            if content and mentions_ai(content):
+            selected_ai_route = select_room_ai_route(
+                content,
+                payload.get("aiRouting"),
+                fallback_route=fallback_route,
+            )
+            if content and selected_ai_route:
                 request_id = secrets.token_hex(8)
                 history = await room_hub.snapshot(normalized_room)
+                selected_trigger = str(selected_ai_route.get("trigger") or "ai")
+                direct_prompt = extract_agent_prompt_from_mention(content, selected_trigger)
                 ai_messages = build_room_ai_messages(
                     history,
                     requester_name=username,
-                    agent_name=agent_name,
-                    system_prompt=system_prompt,
+                    agent_name=str(selected_ai_route.get("agent_name") or agent_name),
+                    system_prompt=str(selected_ai_route.get("system_prompt") or ""),
+                    context_mode=str(selected_ai_route.get("context_mode") or "room"),
+                    direct_prompt=direct_prompt,
                 )
                 pending_ai_requests[request_id] = {
-                    "agent_name": agent_name,
-                    "model_id": model_id,
+                    "agent_name": str(selected_ai_route.get("agent_name") or agent_name),
+                    "model_id": str(selected_ai_route.get("model_id") or model_id),
                 }
                 await room_hub.append_and_broadcast(
                     normalized_room,
@@ -1121,8 +1395,11 @@ async def room_socket(websocket: WebSocket, room_name: str) -> None:
                         event_type="system",
                         sender="system",
                         speaker_type="system",
-                        content=f"{agent_name} is generating a local reply with {model_id}.",
-                        model_id=model_id,
+                        content=(
+                            f"{str(selected_ai_route.get('agent_name') or agent_name)} "
+                            f"is generating a local reply with {str(selected_ai_route.get('model_id') or model_id)}."
+                        ),
+                        model_id=str(selected_ai_route.get("model_id") or model_id),
                     ),
                 )
                 await websocket.send_json(
@@ -1131,11 +1408,11 @@ async def room_socket(websocket: WebSocket, room_name: str) -> None:
                         "requestId": request_id,
                         "room": normalized_room,
                         "requester": username,
-                        "agentName": agent_name,
-                        "modelId": model_id,
-                        "temperature": temperature,
-                        "maxTokens": max_tokens,
-                        "providerOptions": provider_options,
+                        "agentName": str(selected_ai_route.get("agent_name") or agent_name),
+                        "modelId": str(selected_ai_route.get("model_id") or model_id),
+                        "temperature": selected_ai_route.get("temperature", temperature),
+                        "maxTokens": selected_ai_route.get("max_tokens", max_tokens),
+                        "providerOptions": selected_ai_route.get("provider_options", provider_options),
                         "messages": [message.model_dump() for message in ai_messages],
                     }
                 )
@@ -1298,6 +1575,131 @@ async def append_llm_response_log(
             return
 
 
+def request_huggingface_tts_audio(
+    *,
+    api_key: str,
+    model_id: str,
+    text: str,
+    voice: str = "",
+) -> tuple[bytes, str]:
+    endpoint = f"https://router.huggingface.co/hf-inference/models/{quote(model_id, safe='')}"
+    payload: dict[str, Any] = {
+        "text_inputs": text,
+    }
+    parameters: dict[str, Any] = {}
+    if voice:
+        parameters["voice"] = voice
+    if parameters:
+        payload["parameters"] = parameters
+
+    body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+    request_headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "audio/mpeg, audio/wav, audio/*, application/json",
+    }
+    response_body = b""
+    response_type = "application/octet-stream"
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        request_obj = urllib_request.Request(
+            endpoint,
+            data=body,
+            headers=request_headers,
+            method="POST",
+        )
+        try:
+            with urllib_request.urlopen(request_obj, timeout=90) as response:
+                response_body = response.read()
+                response_type = response.headers.get_content_type() or "application/octet-stream"
+                break
+        except error.HTTPError as exc:
+            retry_after = _hf_tts_retry_after_seconds(exc)
+            if retry_after > 0 and attempt < max_attempts - 1:
+                time.sleep(retry_after)
+                continue
+            detail = _parse_hf_tts_error(exc)
+            raise RuntimeError(detail) from exc
+        except (error.URLError, TimeoutError, OSError) as exc:
+            raise RuntimeError(f"Hugging Face TTS request failed: {exc}") from exc
+
+    if not response_body:
+        raise RuntimeError("Hugging Face TTS returned empty audio.")
+
+    if response_type.startswith("application/json"):
+        detail = _extract_hf_tts_error_message(response_body) or "Hugging Face TTS returned JSON instead of audio."
+        raise RuntimeError(detail)
+
+    if not response_type.startswith("audio/"):
+        raise RuntimeError(f"Hugging Face TTS returned unsupported media type: {response_type}")
+
+    return response_body, response_type
+
+
+def _parse_hf_tts_error(exc: error.HTTPError) -> str:
+    status_code = getattr(exc, "code", 0)
+    response_body = b""
+    try:
+        response_body = exc.read()
+    except OSError:
+        response_body = b""
+    detail = _extract_hf_tts_error_message(response_body) if response_body else ""
+    if not detail:
+        detail = f"Hugging Face TTS request failed ({status_code})."
+    if status_code == 401:
+        return "Hugging Face TTS unauthorized. Check HUGGINGFACE_API_KEY."
+    if status_code == 410:
+        return (
+            "This TTS model is deprecated or not served by hf-inference. "
+            "Try microsoft/speecht5_tts or another model currently available in HF Inference."
+        )
+    if status_code == 429:
+        return "Hugging Face TTS rate limited this request."
+    return detail
+
+
+def _hf_tts_retry_after_seconds(exc: error.HTTPError) -> int:
+    status_code = getattr(exc, "code", 0)
+    if status_code != 503:
+        return 0
+    response_body = b""
+    try:
+        response_body = exc.read()
+    except OSError:
+        response_body = b""
+    parsed = _parse_hf_tts_error_payload(response_body)
+    if not parsed:
+        return 2
+    estimated = parsed.get("estimated_time")
+    if isinstance(estimated, (int, float)):
+        return max(1, min(15, int(estimated) + 1))
+    message = str(parsed.get("error") or parsed.get("detail") or "").lower()
+    if "loading" in message or "currently loading" in message:
+        return 3
+    return 0
+
+
+def _parse_hf_tts_error_payload(raw_payload: bytes) -> dict[str, Any]:
+    if not raw_payload:
+        return {}
+    try:
+        parsed = json.loads(raw_payload.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _extract_hf_tts_error_message(raw_payload: bytes) -> str:
+    parsed = _parse_hf_tts_error_payload(raw_payload)
+    if parsed:
+        if isinstance(parsed.get("error"), str):
+            return parsed["error"][:300]
+        detail = parsed.get("detail")
+        if isinstance(detail, str):
+            return detail[:300]
+    return ""
+
+
 def connection_host(connection: Request | WebSocket) -> str:
     forwarded = connection.headers.get("x-forwarded-for", "").strip()
     if forwarded:
@@ -1366,7 +1768,8 @@ def build_room_event(
     message_type: str = "text",
     attachments: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    return {
+    created_at = int(time.time() * 1000)
+    message = {
         "id": secrets.token_hex(10),
         "type": event_type,
         "sender": sender,
@@ -1375,8 +1778,11 @@ def build_room_event(
         "modelId": model_id,
         "messageType": message_type if message_type in {"text", "image", "file"} else "text",
         "attachments": [item for item in (attachments or []) if isinstance(item, dict)],
-        "createdAt": int(time.time() * 1000),
+        "createdAt": created_at,
     }
+    if str(speaker_type).lower() == "system":
+        message["expiresAt"] = created_at + ROOM_SYSTEM_MESSAGE_TTL_MS
+    return message
 
 
 def normalize_room_name(value: str, fallback: str = "lobby") -> str:
@@ -1392,6 +1798,32 @@ def normalize_room_label(value: Any, fallback: str = "Room AI") -> str:
 
 def normalize_room_system_prompt(value: Any) -> str:
     return str(value or "").strip()[:4000]
+
+
+def normalize_room_message_content(value: Any) -> str:
+    normalized = re.sub(r"\s+", " ", str(value or "")).strip()
+    return normalized[:ROOM_CHAT_CONTENT_MAX_CHARS]
+
+
+def normalize_hf_tts_text(value: Any) -> str:
+    normalized = re.sub(r"\s+", " ", str(value or "")).strip()
+    return normalized[:HF_TTS_TEXT_CHAR_LIMIT]
+
+
+def normalize_hf_tts_model(value: Any) -> str:
+    cleaned = re.sub(r"\s+", "", str(value or "").strip())
+    if not cleaned:
+        return HF_TTS_DEFAULT_MODEL
+    normalized = re.sub(r"[^a-zA-Z0-9._/-]+", "", cleaned)
+    if normalized.lower() == "hexgrad/kokoro-82m":
+        return HF_TTS_DEFAULT_MODEL
+    return normalized[:HF_TTS_MODEL_MAX_CHARS] or HF_TTS_DEFAULT_MODEL
+
+
+def normalize_hf_tts_voice(value: Any) -> str:
+    cleaned = re.sub(r"\s+", "", str(value or "").strip())
+    normalized = re.sub(r"[^a-zA-Z0-9._-]+", "", cleaned)
+    return normalized[:HF_TTS_VOICE_MAX_CHARS]
 
 
 def normalize_reaction_emoji(value: Any) -> str:
@@ -1477,6 +1909,257 @@ def normalize_room_chat_attachments(value: Any) -> list[dict[str, Any]]:
             }
         )
     return normalized
+
+
+def build_pictochat_html(*, title: str, board_id: str) -> str:
+    safe_title = re.sub(r"[<>&]", "", title).strip() or "Pictochat"
+    board_label = re.sub(r"[^a-zA-Z0-9_-]+", "", board_id)[:16] or "board"
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{safe_title}</title>
+  <style>
+    :root {{
+      --bg: #f4f7ff;
+      --panel: #ffffff;
+      --ink: #1c2552;
+      --line: #2a3e82;
+      --accent: #0f9d58;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: "Trebuchet MS", Tahoma, sans-serif;
+      background: linear-gradient(180deg, #eef3ff 0%, #e0ebff 100%);
+      color: var(--ink);
+    }}
+    .shell {{
+      display: grid;
+      gap: 10px;
+      padding: 10px;
+    }}
+    .header {{
+      border: 2px solid var(--line);
+      background: var(--panel);
+      padding: 8px;
+      font-weight: 800;
+      letter-spacing: 0.02em;
+    }}
+    .layout {{
+      display: grid;
+      gap: 10px;
+      grid-template-columns: minmax(0, 1fr) 220px;
+    }}
+    .card {{
+      border: 2px solid var(--line);
+      background: var(--panel);
+      padding: 8px;
+    }}
+    .tools {{
+      display: grid;
+      gap: 6px;
+    }}
+    .tools button {{
+      padding: 7px 10px;
+      border: 2px solid var(--line);
+      background: linear-gradient(180deg, #ffffff 0%, #deebff 100%);
+      color: var(--ink);
+      font-weight: 700;
+      cursor: pointer;
+    }}
+    .tools button.active {{
+      background: linear-gradient(180deg, #ccffdd 0%, #a6f1be 100%);
+      border-color: #0d7a42;
+    }}
+    .tools input {{
+      width: 100%;
+    }}
+    canvas {{
+      display: block;
+      width: 100%;
+      min-height: 280px;
+      border: 2px solid var(--line);
+      background: #ffffff;
+      touch-action: none;
+      cursor: crosshair;
+    }}
+    .chat-log {{
+      display: grid;
+      gap: 6px;
+      max-height: 180px;
+      overflow: auto;
+      border: 2px solid var(--line);
+      padding: 6px;
+      background: #f9fbff;
+    }}
+    .chat-line {{
+      border: 1px solid #b8c8ff;
+      padding: 5px;
+      background: #ffffff;
+      font-size: 0.88rem;
+    }}
+    .chat-compose {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 6px;
+      margin-top: 6px;
+    }}
+    .chat-compose input {{
+      padding: 7px 8px;
+      border: 2px solid var(--line);
+    }}
+    .chat-compose button {{
+      padding: 7px 10px;
+      border: 2px solid var(--line);
+      background: linear-gradient(180deg, #dbffe9 0%, #bcf8cf 100%);
+      color: #0b5a31;
+      font-weight: 800;
+      cursor: pointer;
+    }}
+    .hint {{
+      font-size: 0.78rem;
+      color: #3b4b82;
+    }}
+    @media (max-width: 760px) {{
+      .layout {{ grid-template-columns: 1fr; }}
+    }}
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="header">{safe_title} :: Board {board_label}</div>
+    <div class="layout">
+      <section class="card">
+        <canvas id="pictochat-canvas" width="920" height="460"></canvas>
+        <div class="hint">Draw anything. This board is local to this file view.</div>
+      </section>
+      <aside class="card">
+        <div class="tools">
+          <button type="button" data-color="#1c2552" class="active">Ink</button>
+          <button type="button" data-color="#db2e79">Pink</button>
+          <button type="button" data-color="#0f9d58">Green</button>
+          <button type="button" data-color="#ca8a04">Gold</button>
+          <button type="button" data-color="#ffffff">Eraser</button>
+          <label>
+            Brush
+            <input id="brush-size" type="range" min="1" max="30" step="1" value="4">
+          </label>
+          <button id="clear-canvas" type="button">Clear Canvas</button>
+        </div>
+      </aside>
+    </div>
+
+    <section class="card">
+      <strong>Pictochat Notes</strong>
+      <div id="chat-log" class="chat-log"></div>
+      <div class="chat-compose">
+        <input id="chat-input" type="text" maxlength="220" placeholder="Write a note about this board...">
+        <button id="chat-send" type="button">Post</button>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    (function () {{
+      const canvas = document.getElementById("pictochat-canvas");
+      const context = canvas.getContext("2d");
+      const brushSizeInput = document.getElementById("brush-size");
+      const colorButtons = Array.from(document.querySelectorAll("[data-color]"));
+      const clearButton = document.getElementById("clear-canvas");
+      const chatLog = document.getElementById("chat-log");
+      const chatInput = document.getElementById("chat-input");
+      const chatSend = document.getElementById("chat-send");
+
+      let drawing = false;
+      let color = "#1c2552";
+      let brushSize = Number(brushSizeInput.value || 4);
+
+      function setColor(next) {{
+        color = next;
+        colorButtons.forEach((button) => button.classList.toggle("active", button.dataset.color === next));
+      }}
+
+      function toLocalPoint(event) {{
+        const rect = canvas.getBoundingClientRect();
+        const scaleX = canvas.width / rect.width;
+        const scaleY = canvas.height / rect.height;
+        return {{
+          x: (event.clientX - rect.left) * scaleX,
+          y: (event.clientY - rect.top) * scaleY,
+        }};
+      }}
+
+      function start(event) {{
+        drawing = true;
+        const point = toLocalPoint(event);
+        context.beginPath();
+        context.moveTo(point.x, point.y);
+      }}
+
+      function move(event) {{
+        if (!drawing) {{
+          return;
+        }}
+        const point = toLocalPoint(event);
+        context.lineWidth = brushSize;
+        context.lineCap = "round";
+        context.lineJoin = "round";
+        context.strokeStyle = color;
+        context.lineTo(point.x, point.y);
+        context.stroke();
+      }}
+
+      function stop() {{
+        drawing = false;
+        context.closePath();
+      }}
+
+      function appendChatLine(text) {{
+        const line = document.createElement("div");
+        line.className = "chat-line";
+        line.textContent = text;
+        chatLog.append(line);
+        chatLog.scrollTop = chatLog.scrollHeight;
+      }}
+
+      function sendChatLine() {{
+        const value = String(chatInput.value || "").trim();
+        if (!value) {{
+          return;
+        }}
+        appendChatLine(value);
+        chatInput.value = "";
+      }}
+
+      canvas.addEventListener("pointerdown", start);
+      canvas.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", stop);
+      canvas.addEventListener("pointerleave", stop);
+      brushSizeInput.addEventListener("input", () => {{
+        brushSize = Number(brushSizeInput.value || 4);
+      }});
+      colorButtons.forEach((button) => {{
+        button.addEventListener("click", () => setColor(button.dataset.color || "#1c2552"));
+      }});
+      clearButton.addEventListener("click", () => {{
+        context.clearRect(0, 0, canvas.width, canvas.height);
+      }});
+      chatSend.addEventListener("click", sendChatLine);
+      chatInput.addEventListener("keydown", (event) => {{
+        if (event.key === "Enter") {{
+          event.preventDefault();
+          sendChatLine();
+        }}
+      }});
+
+      appendChatLine("Pictochat ready. Draw and drop quick notes here.");
+    }})();
+  </script>
+</body>
+</html>
+"""
 
 
 async def write_upload_to_disk(upload: UploadFile, destination: Path, *, max_bytes: int | None) -> int:
@@ -1804,13 +2487,108 @@ def extract_bibtex_keys(content: str) -> list[str]:
     return keys[:48]
 
 
-def mentions_ai(value: str) -> bool:
-    return bool(re.search(r"(?<!\w)@ai\b", value, flags=re.IGNORECASE))
+def normalize_agent_trigger(value: Any, fallback: str = "ai") -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(value or "").strip().lstrip("@").lower()).strip("-")
+    return (cleaned[:24] or fallback).lower()
 
 
-def strip_ai_mentions(value: str) -> str:
-    cleaned = re.sub(r"(?<!\w)@ai\b[:,]?\s*", "", value, flags=re.IGNORECASE).strip()
+def normalize_agent_context_mode(value: Any) -> str:
+    return "mention" if str(value or "").strip().lower() == "mention" else "room"
+
+
+def list_agent_mentions(value: str) -> list[str]:
+    mentions: list[str] = []
+    for match in re.finditer(r"(?<!\w)@([a-z0-9._-]+)\b", str(value or ""), flags=re.IGNORECASE):
+        mentions.append(normalize_agent_trigger(match.group(1)))
+    return mentions
+
+
+def strip_agent_mentions(value: str) -> str:
+    cleaned = re.sub(r"(?<!\w)@[a-z0-9._-]+\b[:,]?\s*", "", str(value or ""), flags=re.IGNORECASE).strip()
     return cleaned or "Respond to the latest chat room discussion."
+
+
+def extract_agent_prompt_from_mention(content: str, trigger: str) -> str:
+    cleaned_trigger = normalize_agent_trigger(trigger)
+    pattern = re.compile(rf"(?<!\w)@{re.escape(cleaned_trigger)}\b[:,]?\s*", flags=re.IGNORECASE)
+    match = pattern.search(content or "")
+    if not match:
+        return strip_agent_mentions(content)
+    mention_prompt = str(content or "")[match.end() :].strip()
+    return mention_prompt or "Respond to the latest chat room discussion."
+
+
+def normalize_route_model_id(value: Any, fallback: str) -> str:
+    candidate = str(value or "").strip()
+    return candidate or fallback
+
+
+def normalize_route_provider_options(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def parse_route_entry(entry: Any, fallback_route: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(entry, dict):
+        return None
+    trigger = normalize_agent_trigger(entry.get("mentionTrigger") or entry.get("trigger"), fallback="")
+    if not trigger:
+        return None
+    model_fallback = str(fallback_route.get("model_id") or "ollama:qwen2.5:7b")
+    return {
+        "trigger": trigger,
+        "agent_name": normalize_room_label(entry.get("name") or entry.get("agentName"), fallback=fallback_route["agent_name"]),
+        "system_prompt": normalize_room_system_prompt(entry.get("systemPrompt")),
+        "model_id": normalize_route_model_id(entry.get("modelId"), fallback=model_fallback),
+        "temperature": clamp_float(entry.get("temperature"), default=fallback_route["temperature"], minimum=0.0, maximum=2.0),
+        "max_tokens": clamp_int(entry.get("maxTokens"), default=fallback_route["max_tokens"], minimum=64, maximum=4096),
+        "provider_options": normalize_route_provider_options(entry.get("providerOptions")),
+        "context_mode": normalize_agent_context_mode(entry.get("contextMode")),
+    }
+
+
+def select_room_ai_route(
+    content: str,
+    ai_routing: Any,
+    *,
+    fallback_route: dict[str, Any],
+) -> dict[str, Any] | None:
+    mentions = list_agent_mentions(content)
+    if not mentions:
+        return None
+
+    routes_by_trigger: dict[str, dict[str, Any]] = {}
+    if isinstance(ai_routing, dict):
+        saved_agents = ai_routing.get("savedAgents")
+        if isinstance(saved_agents, list):
+            for entry in saved_agents:
+                parsed = parse_route_entry(entry, fallback_route)
+                if parsed:
+                    routes_by_trigger[parsed["trigger"]] = parsed
+        default_entry = ai_routing.get("defaultAgent")
+        parsed_default = parse_route_entry(default_entry, fallback_route) if default_entry is not None else None
+        if parsed_default:
+            routes_by_trigger.setdefault(parsed_default["trigger"], parsed_default)
+
+    fallback_trigger = normalize_agent_trigger(fallback_route.get("trigger"), fallback="ai")
+    routes_by_trigger.setdefault(
+        fallback_trigger,
+        {
+            "trigger": fallback_trigger,
+            "agent_name": fallback_route["agent_name"],
+            "system_prompt": fallback_route["system_prompt"],
+            "model_id": fallback_route["model_id"],
+            "temperature": fallback_route["temperature"],
+            "max_tokens": fallback_route["max_tokens"],
+            "provider_options": fallback_route["provider_options"],
+            "context_mode": normalize_agent_context_mode(fallback_route.get("context_mode")),
+        },
+    )
+
+    for mention in mentions:
+        matched = routes_by_trigger.get(mention)
+        if matched:
+            return matched
+    return None
 
 
 def clamp_float(value: Any, *, default: float, minimum: float, maximum: float) -> float:
@@ -1853,6 +2631,8 @@ def build_room_ai_messages(
     requester_name: str,
     agent_name: str,
     system_prompt: str,
+    context_mode: str = "room",
+    direct_prompt: str = "",
 ) -> list[ChatMessage]:
     transcript: list[ChatMessage] = []
     for item in history:
@@ -1890,15 +2670,25 @@ def build_room_ai_messages(
             transcript.append(ChatMessage(role="assistant", content=content))
             continue
 
-        transcript.append(ChatMessage(role="user", content=f"{sender}: {strip_ai_mentions(content)}"))
+        transcript.append(ChatMessage(role="user", content=f"{sender}: {strip_agent_mentions(content)}"))
 
     system_parts = [
         ROOM_AI_SYSTEM_PROMPT,
         f"You are {agent_name}, replying on behalf of {requester_name}.",
-        "The transcript is shared across the room, so stay consistent with the ongoing conversation.",
     ]
+    if normalize_agent_context_mode(context_mode) == "mention":
+        system_parts.append("Only use the direct text after your trigger mention as context.")
+    else:
+        system_parts.append("The transcript is shared across the room, so stay consistent with the ongoing conversation.")
     if system_prompt:
         system_parts.append(f"Additional instructions: {system_prompt}")
+
+    if normalize_agent_context_mode(context_mode) == "mention":
+        prompt = direct_prompt.strip() or "Respond to the latest chat room discussion."
+        return [
+            ChatMessage(role="system", content=" ".join(system_parts)),
+            ChatMessage(role="user", content=f"{requester_name}: {prompt}"),
+        ]
 
     trimmed = trim_room_context(transcript)
     return [ChatMessage(role="system", content=" ".join(system_parts)), *trimmed]

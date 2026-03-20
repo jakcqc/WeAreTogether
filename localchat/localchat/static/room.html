@@ -93,7 +93,7 @@
               <div class="pixel-box-title">Room Notes</div>
               <div class="pixel-box-body">
                 <p><strong>Transcript:</strong> everyone in the room sees the same messages and AI completions.</p>
-                <p><strong>AI owner:</strong> <code>@ai</code> runs on the sender's own runtime URL and sends results back to the room.</p>
+                <p><strong>AI owner:</strong> Use <code>@trigger</code> (for example <code>@ai</code> or <code>@review</code>) to run your local agents.</p>
                 <p><strong>Your runtime:</strong> <code id="room-runtime-label">loading...</code> (from <code>OLLAMA_BASE_URL</code> on this client server)</p>
                 <p><strong>Remote target:</strong> point this page at a LocalChat server exposing <code>/ws/rooms/&lt;room&gt;</code>.</p>
                 <p><strong>Private collab:</strong> keep the host's room page local-only and have collaborators run LocalChat from source with the host IP.</p>
@@ -141,11 +141,6 @@
                 </div>
               </section>
 
-              <div class="room-search-bar">
-                <input id="room-search-input" class="select-input" type="text" placeholder="Search transcript (fuzzy)">
-                <span id="room-search-status" class="room-search-status">0 matches</span>
-                <button id="room-search-clear-button" class="secondary-button" type="button">Clear</button>
-              </div>
               <section id="room-messages" class="messages room-messages"></section>
 
               <footer class="composer-shell">
@@ -161,6 +156,7 @@
                   <textarea id="room-message-input" placeholder="Chat with the room. Use @ai to ask your room agent." rows="1"></textarea>
                   <div class="composer-actions">
                     <button id="pick-room-image-button" class="secondary-button" type="button" disabled>Add Files</button>
+                    <button id="send-pictochat-button" class="secondary-button" type="button" disabled>Send Pictochat</button>
                     <button id="send-room-button" class="primary-button" type="button" disabled>Send To Room</button>
                   </div>
                 </div>
@@ -169,12 +165,44 @@
 
             <aside class="chat-sidepanel room-sidepanel">
               <div class="pixel-box">
-                <div class="pixel-box-title">Model Deck</div>
-                <div class="pixel-box-body">
+                <div class="room-panel-header">
+                  <div class="pixel-box-title">Fuzzy Search</div>
+                  <button id="room-search-panel-toggle" class="secondary-button room-panel-toggle" type="button" aria-expanded="true">Collapse</button>
+                </div>
+                <div id="room-search-panel-body" class="pixel-box-body">
+                  <div class="room-search-bar room-search-bar-panel">
+                    <input id="room-search-input" class="select-input" type="text" placeholder="Search transcript (fuzzy)">
+                    <span id="room-search-status" class="room-search-status">0 matches</span>
+                    <div class="room-search-nav">
+                      <button id="room-search-prev-button" class="secondary-button" type="button" disabled>Prev</button>
+                      <button id="room-search-next-button" class="secondary-button" type="button" disabled>Next</button>
+                      <span id="room-search-nav-status" class="room-search-nav-status">0 / 0</span>
+                      <button id="room-search-clear-button" class="secondary-button" type="button">Clear</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="pixel-box">
+                <div class="room-panel-header">
+                  <div class="pixel-box-title">Model Deck</div>
+                  <button id="room-agent-panel-toggle" class="secondary-button room-panel-toggle" type="button" aria-expanded="true">Collapse</button>
+                </div>
+                <div id="room-agent-panel-body" class="pixel-box-body">
                   <div class="section-label">Saved Agent</div>
                   <select id="room-agent-select" class="select-input"></select>
                   <div class="section-label">Agent Name</div>
                   <input id="room-agent-name-input" class="select-input" type="text" placeholder="Room AI">
+                  <div class="section-label">Trigger Word</div>
+                  <div class="room-trigger-row">
+                    <span class="room-trigger-prefix">@</span>
+                    <input id="room-agent-trigger-input" class="select-input" type="text" placeholder="ai">
+                  </div>
+                  <div class="section-label">Context Mode</div>
+                  <select id="room-agent-context-select" class="select-input">
+                    <option value="room">Shared Room Context</option>
+                    <option value="mention">Mention Text Only</option>
+                  </select>
                   <div class="agent-actions">
                     <button id="save-room-agent-button" class="secondary-button" type="button">Save Agent</button>
                     <button id="delete-room-agent-button" class="secondary-button" type="button">Delete Agent</button>
@@ -187,6 +215,31 @@
                   <input id="room-max-tokens-input" class="select-input" type="number" min="64" max="4096" step="64" value="512">
                   <div class="section-label">System Prompt</div>
                   <textarea id="room-system-prompt" class="system-prompt" placeholder="Optional behavior instructions for your room agent"></textarea>
+                </div>
+              </div>
+
+              <div class="pixel-box">
+                <div class="pixel-box-title">Voice Reader</div>
+                <div class="pixel-box-body room-tts-settings">
+                  <label class="room-tts-toggle">
+                    <input id="room-tts-enabled-input" type="checkbox">
+                    <span>Enable message read-aloud buttons</span>
+                  </label>
+                  <label class="field-stack">
+                    <span>Hugging Face TTS Model</span>
+                    <input id="room-tts-model-input" class="select-input" type="text" value="hexgrad/Kokoro-82M" placeholder="hexgrad/Kokoro-82M">
+                  </label>
+                  <label class="field-stack">
+                    <span>Voice (optional)</span>
+                    <input id="room-tts-voice-input" class="select-input" type="text" placeholder="af_bella">
+                  </label>
+                  <label class="field-stack">
+                    <span>Playback Speed</span>
+                    <div class="room-tts-rate-row">
+                      <input id="room-tts-rate-input" type="range" min="0.75" max="1.5" step="0.05" value="1">
+                      <span id="room-tts-rate-value" class="room-tts-rate-value">1.00x</span>
+                    </div>
+                  </label>
                 </div>
               </div>
             </aside>

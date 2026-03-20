@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>jeff Pictochat</title>
+  <style>
+    :root {
+      --bg: #f4f7ff;
+      --panel: #ffffff;
+      --ink: #1c2552;
+      --line: #2a3e82;
+      --accent: #0f9d58;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Trebuchet MS", Tahoma, sans-serif;
+      background: linear-gradient(180deg, #eef3ff 0%, #e0ebff 100%);
+      color: var(--ink);
+    }
+    .shell {
+      display: grid;
+      gap: 10px;
+      padding: 10px;
+    }
+    .header {
+      border: 2px solid var(--line);
+      background: var(--panel);
+      padding: 8px;
+      font-weight: 800;
+      letter-spacing: 0.02em;
+    }
+    .layout {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: minmax(0, 1fr) 220px;
+    }
+    .card {
+      border: 2px solid var(--line);
+      background: var(--panel);
+      padding: 8px;
+    }
+    .tools {
+      display: grid;
+      gap: 6px;
+    }
+    .tools button {
+      padding: 7px 10px;
+      border: 2px solid var(--line);
+      background: linear-gradient(180deg, #ffffff 0%, #deebff 100%);
+      color: var(--ink);
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .tools button.active {
+      background: linear-gradient(180deg, #ccffdd 0%, #a6f1be 100%);
+      border-color: #0d7a42;
+    }
+    .tools input {
+      width: 100%;
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      min-height: 280px;
+      border: 2px solid var(--line);
+      background: #ffffff;
+      touch-action: none;
+      cursor: crosshair;
+    }
+    .chat-log {
+      display: grid;
+      gap: 6px;
+      max-height: 180px;
+      overflow: auto;
+      border: 2px solid var(--line);
+      padding: 6px;
+      background: #f9fbff;
+    }
+    .chat-line {
+      border: 1px solid #b8c8ff;
+      padding: 5px;
+      background: #ffffff;
+      font-size: 0.88rem;
+    }
+    .chat-compose {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 6px;
+      margin-top: 6px;
+    }
+    .chat-compose input {
+      padding: 7px 8px;
+      border: 2px solid var(--line);
+    }
+    .chat-compose button {
+      padding: 7px 10px;
+      border: 2px solid var(--line);
+      background: linear-gradient(180deg, #dbffe9 0%, #bcf8cf 100%);
+      color: #0b5a31;
+      font-weight: 800;
+      cursor: pointer;
+    }
+    .hint {
+      font-size: 0.78rem;
+      color: #3b4b82;
+    }
+    @media (max-width: 760px) {
+      .layout { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="header">jeff Pictochat :: Board 4100bc763c</div>
+    <div class="layout">
+      <section class="card">
+        <canvas id="pictochat-canvas" width="920" height="460"></canvas>
+        <div class="hint">Draw anything. This board is local to this file view.</div>
+      </section>
+      <aside class="card">
+        <div class="tools">
+          <button type="button" data-color="#1c2552" class="active">Ink</button>
+          <button type="button" data-color="#db2e79">Pink</button>
+          <button type="button" data-color="#0f9d58">Green</button>
+          <button type="button" data-color="#ca8a04">Gold</button>
+          <button type="button" data-color="#ffffff">Eraser</button>
+          <label>
+            Brush
+            <input id="brush-size" type="range" min="1" max="30" step="1" value="4">
+          </label>
+          <button id="clear-canvas" type="button">Clear Canvas</button>
+        </div>
+      </aside>
+    </div>
+
+    <section class="card">
+      <strong>Pictochat Notes</strong>
+      <div id="chat-log" class="chat-log"></div>
+      <div class="chat-compose">
+        <input id="chat-input" type="text" maxlength="220" placeholder="Write a note about this board...">
+        <button id="chat-send" type="button">Post</button>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    (function () {
+      const canvas = document.getElementById("pictochat-canvas");
+      const context = canvas.getContext("2d");
+      const brushSizeInput = document.getElementById("brush-size");
+      const colorButtons = Array.from(document.querySelectorAll("[data-color]"));
+      const clearButton = document.getElementById("clear-canvas");
+      const chatLog = document.getElementById("chat-log");
+      const chatInput = document.getElementById("chat-input");
+      const chatSend = document.getElementById("chat-send");
+
+      let drawing = false;
+      let color = "#1c2552";
+      let brushSize = Number(brushSizeInput.value || 4);
+
+      function setColor(next) {
+        color = next;
+        colorButtons.forEach((button) => button.classList.toggle("active", button.dataset.color === next));
+      }
+
+      function toLocalPoint(event) {
+        const rect = canvas.getBoundingClientRect();
+        const scaleX = canvas.width / rect.width;
+        const scaleY = canvas.height / rect.height;
+        return {
+          x: (event.clientX - rect.left) * scaleX,
+          y: (event.clientY - rect.top) * scaleY,
+        };
+      }
+
+      function start(event) {
+        drawing = true;
+        const point = toLocalPoint(event);
+        context.beginPath();
+        context.moveTo(point.x, point.y);
+      }
+
+      function move(event) {
+        if (!drawing) {
+          return;
+        }
+        const point = toLocalPoint(event);
+        context.lineWidth = brushSize;
+        context.lineCap = "round";
+        context.lineJoin = "round";
+        context.strokeStyle = color;
+        context.lineTo(point.x, point.y);
+        context.stroke();
+      }
+
+      function stop() {
+        drawing = false;
+        context.closePath();
+      }
+
+      function appendChatLine(text) {
+        const line = document.createElement("div");
+        line.className = "chat-line";
+        line.textContent = text;
+        chatLog.append(line);
+        chatLog.scrollTop = chatLog.scrollHeight;
+      }
+
+      function sendChatLine() {
+        const value = String(chatInput.value || "").trim();
+        if (!value) {
+          return;
+        }
+        appendChatLine(value);
+        chatInput.value = "";
+      }
+
+      canvas.addEventListener("pointerdown", start);
+      canvas.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", stop);
+      canvas.addEventListener("pointerleave", stop);
+      brushSizeInput.addEventListener("input", () => {
+        brushSize = Number(brushSizeInput.value || 4);
+      });
+      colorButtons.forEach((button) => {
+        button.addEventListener("click", () => setColor(button.dataset.color || "#1c2552"));
+      });
+      clearButton.addEventListener("click", () => {
+        context.clearRect(0, 0, canvas.width, canvas.height);
+      });
+      chatSend.addEventListener("click", sendChatLine);
+      chatInput.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          sendChatLine();
+        }
+      });
+
+      appendChatLine("Pictochat ready. Draw and drop quick notes here.");
+    })();
+  </script>
+</body>
+</html>
