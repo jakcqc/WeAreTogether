@@ -226,12 +226,18 @@
                     <span>Enable message read-aloud buttons</span>
                   </label>
                   <label class="field-stack">
-                    <span>Hugging Face TTS Model</span>
-                    <input id="room-tts-model-input" class="select-input" type="text" value="hexgrad/Kokoro-82M" placeholder="hexgrad/Kokoro-82M">
+                    <span>Voice Reader Engine</span>
+                    <select id="room-tts-engine-input" class="select-input">
+                      <option value="local">Local Hugging Face (downloaded)</option>
+                    </select>
                   </label>
                   <label class="field-stack">
-                    <span>Voice (optional)</span>
-                    <input id="room-tts-voice-input" class="select-input" type="text" placeholder="af_bella">
+                    <span>Local TTS Model</span>
+                    <select id="room-tts-model-input" class="select-input"></select>
+                  </label>
+                  <label class="field-stack">
+                    <span>Voice / Speaker Hint (optional)</span>
+                    <input id="room-tts-voice-input" class="select-input" type="text" placeholder="Chelsie">
                   </label>
                   <label class="field-stack">
                     <span>Playback Speed</span>

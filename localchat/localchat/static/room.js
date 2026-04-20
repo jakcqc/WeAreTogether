@@ -3,11 +3,42 @@ const ROOM_AGENTS_KEY = "localchat.roomAgents.v1";
 const DEFAULT_AGENT_ID = "custom";
 const DEFAULT_MODEL_ID = "ollama:qwen2.5:7b";
 const DEFAULT_AI_RUNTIME_URL = "http://127.0.0.1:11434";
-const DEFAULT_TTS_MODEL_ID = "microsoft/speecht5_tts";
+const DEFAULT_TTS_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice";
+const DEFAULT_TTS_ENGINE = "local";
 const ROOM_TTS_TEXT_CHAR_LIMIT = 1200;
+const LOCAL_TTS_MODEL_OPTIONS = [
+  {
+    id: "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    label: "Qwen 3 TTS 1.7B (Local)",
+    minVramGb: 8,
+    notes: "General local TTS voice model.",
+  },
+  {
+    id: "Aratako/T5Gemma-TTS-2b-2b",
+    label: "T5Gemma TTS 2b-2b (Gemma-based, NC)",
+    minVramGb: 12,
+    notes: "Gemma-based multilingual TTS (non-commercial license).",
+  },
+  {
+    id: "Aratako/T5Gemma-TTS-2b-2b-encoder-8bit",
+    label: "T5Gemma TTS 2b-2b Encoder 8-bit (Gemma-based, NC)",
+    minVramGb: 8,
+    notes: "Gemma-based TTS with lower-memory encoder.",
+  },
+  {
+    id: "Aratako/T5Gemma-TTS-2b-2b-encoder-4bit",
+    label: "T5Gemma TTS 2b-2b Encoder 4-bit (Gemma-based, NC)",
+    minVramGb: 6,
+    notes: "Gemma-based TTS with smallest encoder footprint.",
+  },
+];
 const ROOM_EDIT_TEXT_CHAR_LIMIT = 8000;
 const ROOM_SYSTEM_MESSAGE_TTL_MS = 60_000;
 const ROOM_SYSTEM_MESSAGE_FADE_WINDOW_MS = 8_000;
+const PICTOCHAT_SEND_EVENT = "localchat.pictochat.send";
+const PICTOCHAT_SEND_RESULT_EVENT = "localchat.pictochat.send-result";
+const PICTOCHAT_MAX_NOTES = 80;
+const PICTOCHAT_MAX_NOTE_CHARS = 220;
 const WEBRTC_CONFIG = {
   iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
 };
@@ -77,6 +108,7 @@ const elements = {
   systemPromptInput: document.querySelector("#room-system-prompt"),
   temperatureInput: document.querySelector("#room-temperature-input"),
   ttsEnabledInput: document.querySelector("#room-tts-enabled-input"),
+  ttsEngineInput: document.querySelector("#room-tts-engine-input"),
   ttsModelInput: document.querySelector("#room-tts-model-input"),
   ttsRateInput: document.querySelector("#room-tts-rate-input"),
   ttsRateValue: document.querySelector("#room-tts-rate-value"),
@@ -117,6 +149,10 @@ let roomTtsObjectUrl = "";
 let roomTtsRequestController = null;
 let activeTtsMessageId = "";
 let roomSystemMessageTimers = new Map();
+let localRuntimeDiagnostics = {
+  cudaAvailable: false,
+  cudaTotalMemoryGiB: 0,
+};
 
 applyRoomSettingsToForm();
 renderEdgeAds();
@@ -159,6 +195,7 @@ function bindEvents() {
   elements.agentPanelToggle?.addEventListener("click", toggleRoomAgentPanel);
   elements.searchPanelToggle?.addEventListener("click", toggleRoomSearchPanel);
   elements.ttsEnabledInput?.addEventListener("change", onRoomTtsSettingsChange);
+  elements.ttsEngineInput?.addEventListener("change", onRoomTtsSettingsChange);
   elements.ttsModelInput?.addEventListener("change", onRoomTtsSettingsChange);
   elements.ttsVoiceInput?.addEventListener("change", onRoomTtsSettingsChange);
   elements.ttsRateInput?.addEventListener("input", onRoomTtsRateInput);
@@ -186,6 +223,7 @@ function bindEvents() {
   elements.maxTokensInput.addEventListener("change", onRoomConfigInputChange);
   elements.agentContextSelect.addEventListener("change", onRoomConfigInputChange);
   window.addEventListener("resize", renderEdgeAds);
+  window.addEventListener("message", (event) => void onPictochatFrameMessage(event));
   window.addEventListener("beforeunload", () => {
     stopRoomTtsPlayback();
     for (const messageId of roomSystemMessageTimers.keys()) {
@@ -255,8 +293,12 @@ function applyRoomSettingsToForm() {
   if (elements.ttsEnabledInput) {
     elements.ttsEnabledInput.checked = Boolean(roomSettings.ttsEnabled);
   }
+  renderTtsModelOptions();
   if (elements.ttsModelInput) {
-    elements.ttsModelInput.value = roomSettings.ttsModelId || DEFAULT_TTS_MODEL_ID;
+    elements.ttsModelInput.value = normalizeTtsModelId(roomSettings.ttsModelId || DEFAULT_TTS_MODEL_ID);
+  }
+  if (elements.ttsEngineInput) {
+    elements.ttsEngineInput.value = normalizeTtsEngine(roomSettings.ttsEngine || DEFAULT_TTS_ENGINE);
   }
   if (elements.ttsVoiceInput) {
     elements.ttsVoiceInput.value = roomSettings.ttsVoice || "";
@@ -294,6 +336,7 @@ function persistRoomSettingsFromForm() {
     temperature: Number(elements.temperatureInput.value || 0.7),
     maxTokens: Number(elements.maxTokensInput.value || 512),
     ttsEnabled: Boolean(elements.ttsEnabledInput?.checked),
+    ttsEngine: normalizeTtsEngine(elements.ttsEngineInput?.value || roomSettings.ttsEngine || DEFAULT_TTS_ENGINE),
     ttsModelId: normalizeTtsModelId(elements.ttsModelInput?.value || roomSettings.ttsModelId || DEFAULT_TTS_MODEL_ID),
     ttsVoice: normalizeTtsVoice(elements.ttsVoiceInput?.value || roomSettings.ttsVoice || ""),
     ttsPlaybackRate: normalizeTtsPlaybackRate(elements.ttsRateInput?.value || roomSettings.ttsPlaybackRate || 1),
@@ -324,6 +367,7 @@ function loadRoomSettings() {
     temperature: Number(parsed?.temperature ?? 0.7),
     maxTokens: Number(parsed?.maxTokens ?? 512),
     ttsEnabled: Boolean(parsed?.ttsEnabled),
+    ttsEngine: normalizeTtsEngine(parsed?.ttsEngine || DEFAULT_TTS_ENGINE),
     ttsModelId: normalizeTtsModelId(parsed?.ttsModelId || DEFAULT_TTS_MODEL_ID),
     ttsVoice: normalizeTtsVoice(parsed?.ttsVoice || ""),
     ttsPlaybackRate: normalizeTtsPlaybackRate(parsed?.ttsPlaybackRate ?? 1),
@@ -510,6 +554,9 @@ function updateRoomTtsUi() {
   const enabled = Boolean(elements.ttsEnabledInput?.checked);
   const playbackRate = normalizeTtsPlaybackRate(elements.ttsRateInput?.value || roomSettings.ttsPlaybackRate || 1);
 
+  if (elements.ttsEngineInput) {
+    elements.ttsEngineInput.disabled = !enabled;
+  }
   if (elements.ttsModelInput) {
     elements.ttsModelInput.disabled = !enabled;
   }
@@ -523,6 +570,7 @@ function updateRoomTtsUi() {
   if (elements.ttsRateValue) {
     elements.ttsRateValue.textContent = `${playbackRate.toFixed(2)}x`;
   }
+  updateSelectedTtsModelHint();
 }
 
 function persistRoomSettings() {
@@ -536,37 +584,160 @@ async function loadModelsForRuntime() {
   persistRoomSettings();
 
   try {
+    await refreshLocalRuntimeDiagnostics(runtimeBase);
     const modelResult = await fetchRuntimeModels(runtimeBase);
     modelCatalog = modelResult.models;
     modelCatalogById = Object.fromEntries(modelCatalog.map((model) => [model.id, model]));
     modelCatalogSource = modelResult.source;
     renderModelOptions(modelCatalog);
+    renderTtsModelOptions();
     updateStatus(roomSocket ? `Connected to #${roomSettings.roomName}` : "Disconnected");
   } catch (error) {
     modelCatalogSource = "unknown";
     modelCatalog = [{ id: roomSettings.modelId || DEFAULT_MODEL_ID, label: roomSettings.modelId || DEFAULT_MODEL_ID }];
     modelCatalogById = Object.fromEntries(modelCatalog.map((model) => [model.id, model]));
     renderModelOptions(modelCatalog);
+    renderTtsModelOptions();
     appendLocalSystemMessage(`Could not load models from ${runtimeBase}: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
 function renderModelOptions(models) {
   elements.modelSelect.innerHTML = "";
+  const firstEnabledModelId = models.find((model) => isModelSelectableForGpu(model))?.id || "";
   models.forEach((model) => {
     const option = document.createElement("option");
     option.value = model.id;
-    option.textContent = model.label || model.id;
+    option.textContent = buildModelOptionLabel(model);
+    option.disabled = !isModelSelectableForGpu(model);
     elements.modelSelect.append(option);
   });
 
-  const nextValue = models.some((model) => model.id === roomSettings.modelId)
+  const desiredValue = models.some((model) => model.id === roomSettings.modelId)
     ? roomSettings.modelId
     : models[0]?.id || DEFAULT_MODEL_ID;
+  const desiredModel = models.find((model) => model.id === desiredValue);
+  const nextValue = desiredModel && isModelSelectableForGpu(desiredModel)
+    ? desiredValue
+    : firstEnabledModelId || desiredValue;
   elements.modelSelect.value = nextValue;
   roomSettings.modelId = nextValue;
   persistRoomSettings();
   updateRoomMeta();
+}
+
+function buildModelOptionLabel(model) {
+  const base = model?.label || model?.id || "";
+  const minVram = getModelMinVramGb(model);
+  if (!minVram || isModelSelectableForGpu(model)) {
+    return base;
+  }
+  const available = Number(localRuntimeDiagnostics.cudaTotalMemoryGiB || 0);
+  if (!localRuntimeDiagnostics.cudaAvailable) {
+    return `${base} (requires GPU >= ${minVram}GB)`;
+  }
+  return `${base} (needs ${minVram}GB GPU, detected ${available.toFixed(1)}GB)`;
+}
+
+function getModelMinVramGb(model) {
+  const minVram = Number(model?.provider_options?.min_vram_gb ?? 0);
+  return Number.isFinite(minVram) && minVram > 0 ? minVram : 0;
+}
+
+function isModelSelectableForGpu(model) {
+  const minVram = getModelMinVramGb(model);
+  if (!minVram) {
+    return true;
+  }
+  if (!localRuntimeDiagnostics.cudaAvailable) {
+    return false;
+  }
+  const available = Number(localRuntimeDiagnostics.cudaTotalMemoryGiB || 0);
+  return available >= minVram;
+}
+
+async function refreshLocalRuntimeDiagnostics(runtimeBase) {
+  try {
+    const response = await fetch(`${runtimeBase}/api/tts/local/status`, { mode: "cors" });
+    if (!response.ok) {
+      throw new Error(`status ${response.status}`);
+    }
+    const payload = await response.json();
+    const diagnostics = payload?.diagnostics && typeof payload.diagnostics === "object" ? payload.diagnostics : {};
+    localRuntimeDiagnostics = {
+      cudaAvailable: Boolean(diagnostics?.cudaAvailable),
+      cudaTotalMemoryGiB: Number(diagnostics?.cudaTotalMemoryGiB || 0),
+    };
+  } catch {
+    localRuntimeDiagnostics = {
+      cudaAvailable: false,
+      cudaTotalMemoryGiB: 0,
+    };
+  }
+}
+
+function renderTtsModelOptions() {
+  if (!elements.ttsModelInput) {
+    return;
+  }
+  const currentValue = normalizeTtsModelId(roomSettings.ttsModelId || DEFAULT_TTS_MODEL_ID);
+  elements.ttsModelInput.innerHTML = "";
+  let firstEnabled = "";
+  LOCAL_TTS_MODEL_OPTIONS.forEach((optionDef) => {
+    const option = document.createElement("option");
+    const selectable = isTtsModelSelectableForGpu(optionDef);
+    option.value = optionDef.id;
+    option.textContent = buildTtsOptionLabel(optionDef);
+    option.disabled = !selectable;
+    elements.ttsModelInput.append(option);
+    if (!firstEnabled && selectable) {
+      firstEnabled = optionDef.id;
+    }
+  });
+  const preferred = LOCAL_TTS_MODEL_OPTIONS.some((item) => item.id === currentValue) ? currentValue : DEFAULT_TTS_MODEL_ID;
+  const preferredDef = LOCAL_TTS_MODEL_OPTIONS.find((item) => item.id === preferred);
+  const nextValue = preferredDef && isTtsModelSelectableForGpu(preferredDef)
+    ? preferred
+    : (firstEnabled || DEFAULT_TTS_MODEL_ID);
+  elements.ttsModelInput.value = nextValue;
+  roomSettings.ttsModelId = nextValue;
+  persistRoomSettings();
+  updateSelectedTtsModelHint();
+}
+
+function buildTtsOptionLabel(optionDef) {
+  const minVram = Number(optionDef?.minVramGb || 0);
+  if (!minVram || isTtsModelSelectableForGpu(optionDef)) {
+    return optionDef.label;
+  }
+  const available = Number(localRuntimeDiagnostics.cudaTotalMemoryGiB || 0);
+  if (!localRuntimeDiagnostics.cudaAvailable) {
+    return `${optionDef.label} (requires GPU >= ${minVram}GB)`;
+  }
+  return `${optionDef.label} (needs ${minVram}GB GPU, detected ${available.toFixed(1)}GB)`;
+}
+
+function isTtsModelSelectableForGpu(optionDef) {
+  const minVram = Number(optionDef?.minVramGb || 0);
+  if (!minVram) {
+    return true;
+  }
+  if (!localRuntimeDiagnostics.cudaAvailable) {
+    return false;
+  }
+  const available = Number(localRuntimeDiagnostics.cudaTotalMemoryGiB || 0);
+  return available >= minVram;
+}
+
+function updateSelectedTtsModelHint() {
+  const selected = LOCAL_TTS_MODEL_OPTIONS.find((item) => item.id === normalizeTtsModelId(roomSettings.ttsModelId || DEFAULT_TTS_MODEL_ID));
+  if (!selected) {
+    return;
+  }
+  if (elements.ttsVoiceInput) {
+    const note = selected.notes || "Voice / Speaker Hint (optional)";
+    elements.ttsVoiceInput.title = note;
+  }
 }
 
 async function connectToRoom() {
@@ -700,19 +871,7 @@ async function sendPictochatMessage() {
   try {
     persistRoomSettingsFromForm();
     const attachment = await createPictochatAttachment();
-    roomSocket.send(JSON.stringify({
-      type: "chat",
-      messageType: "file",
-      content: `Shared a Pictochat board: ${attachment.name}`,
-      attachments: [attachment],
-      agentName: roomSettings.agentName,
-      systemPrompt: roomSettings.systemPrompt,
-      modelId: roomSettings.modelId,
-      temperature: roomSettings.temperature,
-      maxTokens: roomSettings.maxTokens,
-      providerOptions: getRoomModelProviderOptions(roomSettings.modelId),
-      aiRouting: buildRoomAiRoutingPayload(),
-    }));
+    sendPictochatAttachmentMessage(attachment);
   } catch (error) {
     appendLocalSystemMessage(`Pictochat creation failed: ${error instanceof Error ? error.message : String(error)}`);
   } finally {
@@ -722,19 +881,43 @@ async function sendPictochatMessage() {
   }
 }
 
-async function createPictochatAttachment() {
+function sendPictochatAttachmentMessage(attachment) {
+  if (!roomSocket || roomSocket.readyState !== WebSocket.OPEN) {
+    throw new Error("Room connection is not active.");
+  }
+  roomSocket.send(JSON.stringify({
+    type: "chat",
+    messageType: "file",
+    content: `Shared a Pictochat board: ${attachment.name}`,
+    attachments: [attachment],
+    agentName: roomSettings.agentName,
+    systemPrompt: roomSettings.systemPrompt,
+    modelId: roomSettings.modelId,
+    temperature: roomSettings.temperature,
+    maxTokens: roomSettings.maxTokens,
+    providerOptions: getRoomModelProviderOptions(roomSettings.modelId),
+    aiRouting: buildRoomAiRoutingPayload(),
+  }));
+}
+
+async function createPictochatAttachment(options = {}) {
   const serverBase = normalizeServerBase(roomSettings.serverUrl);
   const roomName = normalizeRoomName(roomSettings.roomName);
   const endpoint = `${serverBase}/api/rooms/${encodeURIComponent(roomName)}/pictochat`;
+  const requestPayload = {
+    title: `${roomSettings.displayName} Pictochat`,
+  };
+  const normalizedSnapshot = normalizePictochatSnapshot(options?.snapshot);
+  if (normalizedSnapshot) {
+    requestPayload.snapshot = normalizedSnapshot;
+  }
   const response = await fetch(endpoint, {
     method: "POST",
     mode: "cors",
     headers: {
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      title: `${roomSettings.displayName} Pictochat`,
-    }),
+    body: JSON.stringify(requestPayload),
   });
   if (!response.ok) {
     let detail = response.statusText;
@@ -752,6 +935,74 @@ async function createPictochatAttachment() {
     throw new Error("Pictochat response was missing attachment data.");
   }
   return attachment;
+}
+
+function normalizePictochatSnapshot(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const drawingDataUrl = String(value.drawingDataUrl || "").trim();
+  const normalized = {};
+  if (drawingDataUrl && /^data:image\/png;base64,[A-Za-z0-9+/=]+$/i.test(drawingDataUrl)) {
+    normalized.drawingDataUrl = drawingDataUrl;
+  }
+  if (Array.isArray(value.notes)) {
+    normalized.notes = value.notes
+      .map((entry) => String(entry || "").replace(/\s+/g, " ").trim().slice(0, PICTOCHAT_MAX_NOTE_CHARS))
+      .filter(Boolean)
+      .slice(0, PICTOCHAT_MAX_NOTES);
+  }
+  return Object.keys(normalized).length ? normalized : null;
+}
+
+function isKnownPictochatSource(sourceWindow) {
+  if (!sourceWindow) {
+    return false;
+  }
+  const frames = document.querySelectorAll(".room-pictochat-frame");
+  for (const frame of frames) {
+    if (frame?.contentWindow === sourceWindow) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function postPictochatSendResult(targetWindow, ok, errorMessage = "") {
+  if (!targetWindow || typeof targetWindow.postMessage !== "function") {
+    return;
+  }
+  targetWindow.postMessage({
+    type: PICTOCHAT_SEND_RESULT_EVENT,
+    ok: Boolean(ok),
+    error: String(errorMessage || ""),
+    sentAt: Date.now(),
+  }, "*");
+}
+
+async function onPictochatFrameMessage(event) {
+  const payload = event?.data;
+  if (!payload || typeof payload !== "object" || payload.type !== PICTOCHAT_SEND_EVENT) {
+    return;
+  }
+  if (!isKnownPictochatSource(event.source)) {
+    return;
+  }
+  try {
+    if (!roomSocket || roomSocket.readyState !== WebSocket.OPEN) {
+      throw new Error("Connect to the room before sending Pictochat.");
+    }
+    persistRoomSettingsFromForm();
+    const attachment = await createPictochatAttachment({
+      snapshot: payload.snapshot,
+    });
+    sendPictochatAttachmentMessage(attachment);
+    postPictochatSendResult(event.source, true);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    appendLocalSystemMessage(`Pictochat send failed: ${detail}`);
+    postPictochatSendResult(event.source, false, detail);
+  }
 }
 
 async function uploadPendingRoomAttachments() {
@@ -1388,7 +1639,7 @@ async function speakRoomMessage(article, button) {
     return;
   }
 
-  if (activeTtsMessageId === messageId && roomTtsAudio && !roomTtsAudio.paused) {
+  if (activeTtsMessageId === messageId) {
     stopRoomTtsPlayback();
     return;
   }
@@ -1398,13 +1649,14 @@ async function speakRoomMessage(article, button) {
     roomTtsRequestController.abort();
   }
   roomTtsRequestController = new AbortController();
-
   setMessageSpeakButtonState(messageId, true);
   button.disabled = true;
 
   try {
-    const response = await fetch("/api/tts/huggingface", {
+    const runtimeBase = normalizeServerBase(resolvedClientRuntimeBase || roomSettings.aiRuntimeUrl || window.location.origin);
+    const response = await fetch(`${runtimeBase}/api/tts/local`, {
       method: "POST",
+      mode: "cors",
       headers: {
         "Content-Type": "application/json",
       },
@@ -2821,17 +3073,20 @@ function normalizeAgentContextMode(value) {
 }
 
 function normalizeTtsModelId(value) {
-  const cleaned = String(value || "")
-    .trim()
-    .replace(/\s+/g, "");
+  const cleaned = String(value || "").trim();
   if (!cleaned) {
     return DEFAULT_TTS_MODEL_ID;
   }
-  const normalized = cleaned.replace(/[^a-zA-Z0-9._/-]+/g, "");
-  if (normalized.toLowerCase() === "hexgrad/kokoro-82m") {
-    return DEFAULT_TTS_MODEL_ID;
+  const selected = LOCAL_TTS_MODEL_OPTIONS.find((item) => item.id.toLowerCase() === cleaned.toLowerCase());
+  return selected?.id || DEFAULT_TTS_MODEL_ID;
+}
+
+function normalizeTtsEngine(value) {
+  const cleaned = String(value || "").trim().toLowerCase();
+  if (cleaned === "local" || cleaned === "huggingface") {
+    return "local";
   }
-  return normalized.slice(0, 120) || DEFAULT_TTS_MODEL_ID;
+  return "local";
 }
 
 function normalizeTtsVoice(value) {

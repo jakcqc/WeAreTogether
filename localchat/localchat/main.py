@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 from datetime import datetime, timezone
 import ipaddress
 import json
+import os
 import re
 import secrets
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -48,6 +51,11 @@ ROOM_SYSTEM_MESSAGE_TTL_MS = 60_000
 ROOM_SYSTEM_CLEANUP_INTERVAL_SECONDS = 1
 ROOM_IMAGE_DATA_URL_MAX_CHARS = 2_000_000
 ROOM_CHAT_ATTACHMENT_NAME_MAX_CHARS = 160
+ROOM_PICTOCHAT_DATA_URL_MAX_CHARS = 3_000_000
+ROOM_PICTOCHAT_NOTE_MAX_CHARS = 220
+ROOM_PICTOCHAT_NOTE_MAX_COUNT = 80
+LOCAL_TTS_DEFAULT_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+LOCAL_TTS_DEVICE_ENV = "LOCAL_TTS_DEVICE"
 DRAFT_CHAT_HISTORY_LIMIT = 80
 DRAFTER_TEXT_ASSET_LIMIT = 250_000
 DRAFTER_IMAGE_ASSET_LIMIT = 3_500_000
@@ -55,6 +63,11 @@ HF_TTS_DEFAULT_MODEL = "microsoft/speecht5_tts"
 HF_TTS_TEXT_CHAR_LIMIT = 1200
 HF_TTS_MODEL_MAX_CHARS = 120
 HF_TTS_VOICE_MAX_CHARS = 64
+GEMMA_TTS_MODELS = {
+    "Aratako/T5Gemma-TTS-2b-2b",
+    "Aratako/T5Gemma-TTS-2b-2b-encoder-8bit",
+    "Aratako/T5Gemma-TTS-2b-2b-encoder-4bit",
+}
 LLM_RESPONSE_LOG_PATH = BASE_DIR / "llm_responses.jsonl"
 DRAFTER_ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
 DRAFTER_ALLOWED_TEXT_EXTENSIONS = {".bib", ".tex"}
@@ -96,6 +109,14 @@ class NoCacheMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(NoCacheMiddleware)
 llm_response_log_lock = asyncio.Lock()
+local_tts_state_lock = threading.Lock()
+local_tts_runtime: dict[str, Any] = {
+    "model_id": "",
+    "device": "",
+    "actual_device": "",
+    "backend": "",
+    "model": None,
+}
 
 
 @app.on_event("startup")
@@ -857,14 +878,23 @@ async def create_room_pictochat(request: Request, room_name: str, payload: dict[
         )
 
     normalized_room = normalize_room_name(room_name, fallback="lobby")
-    normalized_title = normalize_room_label((payload or {}).get("title") or "Pictochat", fallback="Pictochat")
+    payload_dict = payload if isinstance(payload, dict) else {}
+    normalized_title = normalize_room_label(payload_dict.get("title") or "Pictochat", fallback="Pictochat")
+    snapshot = payload_dict.get("snapshot") if isinstance(payload_dict.get("snapshot"), dict) else {}
+    initial_drawing_data_url = normalize_room_pictochat_data_url(snapshot.get("drawingDataUrl"))
+    initial_notes = normalize_room_pictochat_notes(snapshot.get("notes"))
     board_id = secrets.token_hex(5)
     room_dir = ROOM_UPLOADS_DIR / normalized_room
     room_dir.mkdir(parents=True, exist_ok=True)
     normalized_name = normalize_room_attachment_name(f"{normalized_title}.pictochat.html")
     stored_name = f"{int(time.time() * 1000)}-{board_id}-{normalized_name}"
     destination = room_dir / stored_name
-    html_content = build_pictochat_html(title=normalized_title, board_id=board_id)
+    html_content = build_pictochat_html(
+        title=normalized_title,
+        board_id=board_id,
+        initial_drawing_data_url=initial_drawing_data_url,
+        initial_notes=initial_notes,
+    )
     destination.write_text(html_content, encoding="utf-8")
     size = destination.stat().st_size
 
@@ -954,6 +984,57 @@ async def api_models() -> list[ModelResponse]:
 async def client_runtime() -> dict[str, str]:
     settings = get_settings()
     return {"ollamaBaseUrl": settings.ollama_base_url}
+
+
+@app.get("/api/tts/local/status")
+async def local_tts_status() -> dict[str, Any]:
+    with local_tts_state_lock:
+        loaded_model_id = str(local_tts_runtime.get("model_id") or "")
+        loaded_device = str(local_tts_runtime.get("device") or "")
+        actual_device = str(local_tts_runtime.get("actual_device") or "")
+        backend = str(local_tts_runtime.get("backend") or "")
+        model_loaded = local_tts_runtime.get("model") is not None
+    diagnostics = get_local_tts_diagnostics()
+    return {
+        "engine": "local",
+        "loadedModelId": loaded_model_id,
+        "loadedDevice": loaded_device,
+        "actualDevice": actual_device,
+        "backend": backend,
+        "modelLoaded": model_loaded,
+        "diagnostics": diagnostics,
+    }
+
+
+@app.post("/api/tts/local")
+async def local_tts(request: Request, payload: dict[str, Any]) -> StreamingResponse:
+    if not collaboration_client_allowed(request):
+        raise HTTPException(
+            status_code=403,
+            detail="Voice reader requests are limited to localhost or allowlisted client IPs.",
+        )
+
+    text = normalize_hf_tts_text(payload.get("text"))
+    if not text:
+        raise HTTPException(status_code=400, detail="Voice reader text is empty.")
+
+    model_id = normalize_hf_tts_model(payload.get("modelId"))
+    voice = normalize_hf_tts_voice(payload.get("voice"))
+    try:
+        audio_bytes, media_type = await asyncio.to_thread(
+            request_local_hf_tts_audio,
+            model_id=model_id,
+            text=text,
+            voice=voice,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return StreamingResponse(
+        iter([audio_bytes]),
+        media_type=media_type,
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+    )
 
 
 @app.post("/api/tts/huggingface")
@@ -1575,6 +1656,309 @@ async def append_llm_response_log(
             return
 
 
+def get_local_tts_diagnostics() -> dict[str, Any]:
+    diagnostics: dict[str, Any] = {
+        "torchInstalled": False,
+        "cudaAvailable": False,
+        "cudaDeviceCount": 0,
+        "cudaDeviceName": "",
+        "cudaTotalMemoryBytes": 0,
+        "cudaTotalMemoryGiB": 0.0,
+        "torchVersion": "",
+        "cudaVersion": "",
+        "requestedDevice": "auto",
+        "selectedDevice": "cpu",
+    }
+    requested = str(os.getenv(LOCAL_TTS_DEVICE_ENV, "auto") or "auto").strip().lower()
+    diagnostics["requestedDevice"] = requested
+    try:
+        import torch  # pylint: disable=import-outside-toplevel
+    except Exception as exc:  # noqa: BLE001
+        diagnostics["error"] = f"torch import failed: {exc}"
+        return diagnostics
+
+    diagnostics["torchInstalled"] = True
+    diagnostics["torchVersion"] = str(getattr(torch, "__version__", ""))
+    diagnostics["cudaVersion"] = str(getattr(torch.version, "cuda", "") or "")
+    cuda_available = bool(torch.cuda.is_available())
+    diagnostics["cudaAvailable"] = cuda_available
+    diagnostics["cudaDeviceCount"] = int(torch.cuda.device_count()) if cuda_available else 0
+    if cuda_available and diagnostics["cudaDeviceCount"] > 0:
+        diagnostics["cudaDeviceName"] = str(torch.cuda.get_device_name(0) or "")
+        try:
+            total_bytes = int(torch.cuda.get_device_properties(0).total_memory)
+        except Exception:  # noqa: BLE001
+            total_bytes = 0
+        diagnostics["cudaTotalMemoryBytes"] = total_bytes
+        diagnostics["cudaTotalMemoryGiB"] = round(total_bytes / (1024**3), 2) if total_bytes > 0 else 0.0
+
+    selected_device = "cpu"
+    if requested in {"cpu", "cuda", "cuda:0"}:
+        selected_device = "cuda:0" if requested.startswith("cuda") and cuda_available else "cpu"
+    elif requested in {"auto", ""}:
+        selected_device = "cuda:0" if cuda_available else "cpu"
+    diagnostics["selectedDevice"] = selected_device
+    return diagnostics
+
+
+def local_tts_model_id(value: Any) -> str:
+    normalized = normalize_hf_tts_model(value)
+    if not normalized:
+        return LOCAL_TTS_DEFAULT_MODEL
+    return normalized
+
+
+def _pick_local_tts_speaker(model: Any, voice: str) -> str:
+    requested = str(voice or "").strip()
+    try:
+        supported = model.get_supported_speakers() or []
+    except Exception:  # noqa: BLE001
+        supported = []
+    if not supported:
+        return requested or "Chelsie"
+
+    if requested:
+        requested_lower = requested.lower()
+        for candidate in supported:
+            candidate_value = str(candidate or "")
+            if candidate_value.lower() == requested_lower:
+                return candidate_value
+    return str(supported[0] or "Chelsie")
+
+
+def _infer_torch_module_device(value: Any) -> str:
+    module = value
+    if module is None:
+        return ""
+    try:
+        params = getattr(module, "parameters", None)
+        if callable(params):
+            first_param = next(params(), None)
+            if first_param is not None:
+                return str(getattr(first_param, "device", "") or "")
+        buffers = getattr(module, "buffers", None)
+        if callable(buffers):
+            first_buffer = next(buffers(), None)
+            if first_buffer is not None:
+                return str(getattr(first_buffer, "device", "") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+    return ""
+
+
+def _detect_local_tts_device(model: Any) -> str:
+    device = _infer_torch_module_device(model)
+    if device:
+        return device
+    for attr_name in ("model", "tts_model", "generator", "vocoder", "codec_model"):
+        nested = getattr(model, attr_name, None)
+        device = _infer_torch_module_device(nested)
+        if device:
+            return device
+    return ""
+
+
+def _move_local_tts_to_device(model: Any, device: str) -> None:
+    target = str(device or "").strip()
+    if not target:
+        return
+    to_callable = getattr(model, "to", None)
+    if callable(to_callable):
+        to_callable(target)
+    for attr_name in ("model", "tts_model", "generator", "vocoder", "codec_model"):
+        nested = getattr(model, attr_name, None)
+        nested_to = getattr(nested, "to", None)
+        if callable(nested_to):
+            nested_to(target)
+
+
+def _local_tts_backend_for_model(model_id: str) -> str:
+    normalized = str(model_id or "").strip()
+    if normalized in GEMMA_TTS_MODELS:
+        return "transformers"
+    return "qwen_tts"
+
+
+def _load_qwen_local_tts_model(model_id: str, selected_device: str) -> Any:
+    try:
+        import torch  # pylint: disable=import-outside-toplevel
+        from qwen_tts import Qwen3TTSModel  # pylint: disable=import-outside-toplevel
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            "Local TTS dependencies are missing. Run local client setup to install torch/qwen-tts."
+        ) from exc
+
+    load_kwargs: dict[str, Any] = {
+        "device_map": selected_device,
+    }
+    load_kwargs["torch_dtype"] = torch.float16 if selected_device.startswith("cuda") else torch.float32
+    try:
+        return Qwen3TTSModel.from_pretrained(model_id, **load_kwargs)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Could not load local TTS model '{model_id}': {exc}") from exc
+
+
+def _load_transformers_tts_model(model_id: str, selected_device: str) -> Any:
+    try:
+        import torch  # pylint: disable=import-outside-toplevel
+        from transformers import pipeline  # pylint: disable=import-outside-toplevel
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            "Local Gemma TTS dependencies are missing. Install transformers + torch in this environment."
+        ) from exc
+
+    model_kwargs: dict[str, Any] = {
+        "torch_dtype": torch.float16 if selected_device.startswith("cuda") else torch.float32,
+    }
+    device_index = 0 if selected_device.startswith("cuda") else -1
+    try:
+        tts_pipeline = pipeline(
+            task="text-to-speech",
+            model=model_id,
+            device=device_index,
+            trust_remote_code=True,
+            model_kwargs=model_kwargs,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Could not load Gemma TTS model '{model_id}': {exc}") from exc
+    return tts_pipeline
+
+
+def get_local_tts_model(model_id: str) -> tuple[Any, str, str]:
+    normalized_model_id = local_tts_model_id(model_id)
+    backend = _local_tts_backend_for_model(normalized_model_id)
+    diagnostics = get_local_tts_diagnostics()
+    requested_device = str(diagnostics.get("requestedDevice") or "auto")
+    selected_device = str(diagnostics.get("selectedDevice") or "cpu")
+    if requested_device.startswith("cuda") and not selected_device.startswith("cuda"):
+        raise RuntimeError(
+            f"Local TTS is configured for GPU ({requested_device}) but CUDA is unavailable in torch."
+        )
+
+    with local_tts_state_lock:
+        if (
+            local_tts_runtime.get("model") is not None
+            and str(local_tts_runtime.get("model_id") or "") == normalized_model_id
+            and str(local_tts_runtime.get("device") or "") == selected_device
+            and str(local_tts_runtime.get("backend") or "") == backend
+        ):
+            cached_model = local_tts_runtime["model"]
+            cached_actual_device = str(local_tts_runtime.get("actual_device") or "")
+            if not cached_actual_device:
+                cached_actual_device = _detect_local_tts_device(cached_model)
+                local_tts_runtime["actual_device"] = cached_actual_device
+            if selected_device.startswith("cuda") and not cached_actual_device.startswith("cuda"):
+                raise RuntimeError(
+                    f"Local TTS requested GPU ({selected_device}) but cached model is on "
+                    f"'{cached_actual_device or 'unknown'}'."
+                )
+            return cached_model, selected_device, backend
+
+    if backend == "transformers":
+        model = _load_transformers_tts_model(normalized_model_id, selected_device)
+    else:
+        model = _load_qwen_local_tts_model(normalized_model_id, selected_device)
+
+    if selected_device.startswith("cuda"):
+        try:
+            _move_local_tts_to_device(model, selected_device)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"Could not move local TTS model to {selected_device}: {exc}") from exc
+
+    actual_device = _detect_local_tts_device(model)
+    if selected_device.startswith("cuda") and not actual_device.startswith("cuda"):
+        raise RuntimeError(
+            f"Local TTS requested GPU ({selected_device}) but model loaded on '{actual_device or 'unknown'}'."
+        )
+
+    with local_tts_state_lock:
+        local_tts_runtime["model"] = model
+        local_tts_runtime["model_id"] = normalized_model_id
+        local_tts_runtime["device"] = selected_device
+        local_tts_runtime["actual_device"] = actual_device
+        local_tts_runtime["backend"] = backend
+    return model, selected_device, backend
+
+
+def _generate_qwen_local_tts(model: Any, normalized_text: str, voice: str) -> tuple[Any, int]:
+    speaker_name = _pick_local_tts_speaker(model, normalize_hf_tts_voice(voice))
+    try:
+        return model.generate_custom_voice(
+            text=normalized_text,
+            speaker=speaker_name,
+            language=None,
+            non_streaming_mode=True,
+        )
+    except Exception:
+        try:
+            return model.generate_voice_design(
+                text=normalized_text,
+                instruct="Natural clear voice.",
+                language=None,
+                non_streaming_mode=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"Local TTS generation failed: {exc}") from exc
+
+
+def _generate_transformers_local_tts(model: Any, normalized_text: str, voice: str) -> tuple[Any, int]:
+    invoke_kwargs: dict[str, Any] = {}
+    normalized_voice = normalize_hf_tts_voice(voice)
+    if normalized_voice:
+        invoke_kwargs["speaker"] = normalized_voice
+    try:
+        output = model(normalized_text, **invoke_kwargs)
+    except Exception:
+        try:
+            output = model(normalized_text)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"Local Gemma TTS generation failed: {exc}") from exc
+
+    if isinstance(output, dict):
+        waveform = output.get("audio")
+        if waveform is None:
+            waveform = output.get("wav")
+        sample_rate = int(output.get("sampling_rate") or output.get("sample_rate") or 24000)
+        return waveform, sample_rate
+
+    return output, 24000
+
+
+def request_local_hf_tts_audio(
+    *,
+    model_id: str,
+    text: str,
+    voice: str = "",
+) -> tuple[bytes, str]:
+    normalized_model_id = local_tts_model_id(model_id)
+    normalized_text = normalize_hf_tts_text(text)
+    if not normalized_text:
+        raise RuntimeError("Voice reader text is empty.")
+    try:
+        import numpy as np  # pylint: disable=import-outside-toplevel
+        import soundfile as sf  # pylint: disable=import-outside-toplevel
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError("Local TTS audio dependencies are missing (numpy/soundfile).") from exc
+
+    model, _, backend = get_local_tts_model(normalized_model_id)
+    if backend == "transformers":
+        wavs, sample_rate = _generate_transformers_local_tts(model, normalized_text, voice)
+    else:
+        wavs, sample_rate = _generate_qwen_local_tts(model, normalized_text, voice)
+
+    if wavs is None:
+        raise RuntimeError("Local TTS returned empty audio.")
+    waveform = np.asarray(wavs, dtype=np.float32)
+    if waveform.ndim > 1:
+        waveform = waveform[0]
+    if waveform.size == 0:
+        raise RuntimeError("Local TTS returned an empty waveform.")
+
+    buffer = io.BytesIO()
+    sf.write(buffer, waveform, int(sample_rate or 24000), format="WAV")
+    return buffer.getvalue(), "audio/wav"
+
+
 def request_huggingface_tts_audio(
     *,
     api_key: str,
@@ -1851,6 +2235,38 @@ def normalize_room_image_data_url(value: Any) -> str:
     return candidate
 
 
+def normalize_room_pictochat_data_url(value: Any) -> str:
+    candidate = str(value or "").strip()
+    if not candidate:
+        return ""
+    if len(candidate) > ROOM_PICTOCHAT_DATA_URL_MAX_CHARS:
+        return ""
+    pattern = re.compile(r"^data:image\/png;base64,([A-Za-z0-9+/=]+)$", flags=re.IGNORECASE)
+    match = pattern.match(candidate)
+    if not match:
+        return ""
+    try:
+        base64.b64decode(match.group(1), validate=True)
+    except ValueError:
+        return ""
+    return candidate
+
+
+def normalize_room_pictochat_notes(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    notes: list[str] = []
+    for raw_note in value:
+        note = re.sub(r"\s+", " ", str(raw_note or "")).strip()
+        note = note[:ROOM_PICTOCHAT_NOTE_MAX_CHARS]
+        if not note:
+            continue
+        notes.append(note)
+        if len(notes) >= ROOM_PICTOCHAT_NOTE_MAX_COUNT:
+            break
+    return notes
+
+
 def normalize_room_attachment_name(value: Any) -> str:
     raw_name = Path(str(value or "")).name.strip()
     cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", raw_name).strip(" ._-")
@@ -1911,9 +2327,22 @@ def normalize_room_chat_attachments(value: Any) -> list[dict[str, Any]]:
     return normalized
 
 
-def build_pictochat_html(*, title: str, board_id: str) -> str:
+def build_pictochat_html(
+    *,
+    title: str,
+    board_id: str,
+    initial_drawing_data_url: str = "",
+    initial_notes: list[str] | None = None,
+) -> str:
     safe_title = re.sub(r"[<>&]", "", title).strip() or "Pictochat"
     board_label = re.sub(r"[^a-zA-Z0-9_-]+", "", board_id)[:16] or "board"
+    initial_payload = json.dumps(
+        {
+            "drawingDataUrl": initial_drawing_data_url or "",
+            "notes": initial_notes or [],
+        },
+        ensure_ascii=True,
+    )
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1944,8 +2373,35 @@ def build_pictochat_html(*, title: str, board_id: str) -> str:
       border: 2px solid var(--line);
       background: var(--panel);
       padding: 8px;
-      font-weight: 800;
+      font-weight: 700;
       letter-spacing: 0.02em;
+      display: grid;
+      gap: 8px;
+    }}
+    .header-main {{
+      font-weight: 800;
+    }}
+    .header-controls {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }}
+    .header-controls button {{
+      border: 2px solid var(--line);
+      background: linear-gradient(180deg, #d7f3ff 0%, #aee6ff 100%);
+      color: #124267;
+      font-weight: 800;
+      padding: 7px 10px;
+      cursor: pointer;
+    }}
+    .header-controls button:disabled {{
+      cursor: not-allowed;
+      opacity: 0.55;
+    }}
+    .send-status {{
+      font-size: 0.78rem;
+      color: #2d3b6f;
     }}
     .layout {{
       display: grid;
@@ -2029,11 +2485,17 @@ def build_pictochat_html(*, title: str, board_id: str) -> str:
 </head>
 <body>
   <div class="shell">
-    <div class="header">{safe_title} :: Board {board_label}</div>
+    <div class="header">
+      <div class="header-main">{safe_title} :: Board {board_label}</div>
+      <div class="header-controls">
+        <button id="send-to-room" type="button">Send This Snapshot To Room</button>
+        <span id="send-status" class="send-status">Open this board inside a room message to send.</span>
+      </div>
+    </div>
     <div class="layout">
       <section class="card">
         <canvas id="pictochat-canvas" width="920" height="460"></canvas>
-        <div class="hint">Draw anything. This board is local to this file view.</div>
+        <div class="hint">Draw anything. This board only changes in your current view unless you send a snapshot.</div>
       </section>
       <aside class="card">
         <div class="tools">
@@ -2071,10 +2533,17 @@ def build_pictochat_html(*, title: str, board_id: str) -> str:
       const chatLog = document.getElementById("chat-log");
       const chatInput = document.getElementById("chat-input");
       const chatSend = document.getElementById("chat-send");
+      const sendToRoomButton = document.getElementById("send-to-room");
+      const sendStatus = document.getElementById("send-status");
+      const SEND_EVENT = "localchat.pictochat.send";
+      const SEND_RESULT_EVENT = "localchat.pictochat.send-result";
+      const initialBoard = {initial_payload};
 
       let drawing = false;
       let color = "#1c2552";
       let brushSize = Number(brushSizeInput.value || 4);
+      let notes = [];
+      let sendInFlight = false;
 
       function setColor(next) {{
         color = next;
@@ -2116,12 +2585,16 @@ def build_pictochat_html(*, title: str, board_id: str) -> str:
         context.closePath();
       }}
 
-      function appendChatLine(text) {{
+      function appendChatLine(text, options) {{
+        const persist = Boolean(options?.persist);
         const line = document.createElement("div");
         line.className = "chat-line";
         line.textContent = text;
         chatLog.append(line);
         chatLog.scrollTop = chatLog.scrollHeight;
+        if (persist) {{
+          notes.push(text);
+        }}
       }}
 
       function sendChatLine() {{
@@ -2129,8 +2602,66 @@ def build_pictochat_html(*, title: str, board_id: str) -> str:
         if (!value) {{
           return;
         }}
-        appendChatLine(value);
+        appendChatLine(value, {{ persist: true }});
         chatInput.value = "";
+      }}
+
+      function loadInitialBoard() {{
+        if (initialBoard && typeof initialBoard === "object") {{
+          const drawingDataUrl = String(initialBoard.drawingDataUrl || "");
+          if (drawingDataUrl) {{
+            const image = new Image();
+            image.onload = () => {{
+              context.clearRect(0, 0, canvas.width, canvas.height);
+              context.drawImage(image, 0, 0, canvas.width, canvas.height);
+            }};
+            image.src = drawingDataUrl;
+          }}
+          if (Array.isArray(initialBoard.notes) && initialBoard.notes.length) {{
+            initialBoard.notes.forEach((note) => {{
+              const normalized = String(note || "").trim();
+              if (normalized) {{
+                appendChatLine(normalized, {{ persist: true }});
+              }}
+            }});
+          }}
+        }}
+        if (!notes.length) {{
+          appendChatLine("Pictochat ready. Draw and drop quick notes here.");
+        }}
+      }}
+
+      function canSendToRoom() {{
+        return window.parent && window.parent !== window;
+      }}
+
+      function snapshotBoard() {{
+        return {{
+          drawingDataUrl: canvas.toDataURL("image/png"),
+          notes: [...notes],
+        }};
+      }}
+
+      function setSendUiStatus(message, isError) {{
+        sendStatus.textContent = message;
+        sendStatus.style.color = isError ? "#8a1f3a" : "#2d3b6f";
+      }}
+
+      function requestSendToRoom() {{
+        if (sendInFlight) {{
+          return;
+        }}
+        if (!canSendToRoom()) {{
+          setSendUiStatus("Open this board inside a room message to send.", true);
+          return;
+        }}
+        sendInFlight = true;
+        sendToRoomButton.disabled = true;
+        setSendUiStatus("Sending snapshot to room...", false);
+        window.parent.postMessage({{
+          type: SEND_EVENT,
+          snapshot: snapshotBoard(),
+        }}, "*");
       }}
 
       canvas.addEventListener("pointerdown", start);
@@ -2147,14 +2678,36 @@ def build_pictochat_html(*, title: str, board_id: str) -> str:
         context.clearRect(0, 0, canvas.width, canvas.height);
       }});
       chatSend.addEventListener("click", sendChatLine);
+      sendToRoomButton.addEventListener("click", requestSendToRoom);
       chatInput.addEventListener("keydown", (event) => {{
         if (event.key === "Enter") {{
           event.preventDefault();
           sendChatLine();
         }}
       }});
+      window.addEventListener("message", (event) => {{
+        if (event.source !== window.parent) {{
+          return;
+        }}
+        const payload = event.data;
+        if (!payload || typeof payload !== "object" || payload.type !== SEND_RESULT_EVENT) {{
+          return;
+        }}
+        sendInFlight = false;
+        sendToRoomButton.disabled = false;
+        if (payload.ok) {{
+          setSendUiStatus("Snapshot sent. Keep drawing and send another one anytime.", false);
+          return;
+        }}
+        setSendUiStatus(`Send failed: ${{String(payload.error || "Unknown error")}}`, true);
+      }});
 
-      appendChatLine("Pictochat ready. Draw and drop quick notes here.");
+      if (!canSendToRoom()) {{
+        sendToRoomButton.disabled = true;
+      }} else {{
+        setSendUiStatus("Use this to publish a frozen snapshot as a room file.", false);
+      }}
+      loadInitialBoard();
     }})();
   </script>
 </body>

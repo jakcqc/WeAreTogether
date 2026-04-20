@@ -11,12 +11,16 @@ dependencies = [
   "openai>=1.76.0",
   "python-dotenv>=1.1.0",
   "python-multipart>=0.0.22",
+  "qwen-tts>=0.1.1",
+  "soundfile>=0.13.1",
+  "torch>=2.7.0",
   "uvicorn[standard]>=0.34.0",
 ]
 
 [project.scripts]
 localchat = "localchat.main:run"
 localchat-models = "localchat.setup_models:main"
+localchat-bootstrap = "localchat.bootstrap:main"
 
 [build-system]
 requires = ["setuptools>=68"]

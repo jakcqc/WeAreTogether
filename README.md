@@ -1,197 +1,56 @@
 # Local Chat
 
-Local chat app with:
+Local-first collaboration app (room + drafter + sockets) where each client is responsible for their own model runtime setup.
 
-- a FastAPI backend
-- an OpenAI-style `POST /v1/chat/completions` endpoint
-- SSE token streaming
-- provider routing for local Ollama, Hugging Face, and Gemini
-- a plain HTML/CSS/JS frontend with chat history, markdown, syntax highlighting, copy buttons, and model selection
-- chat auto-titles generated from the first completed exchange
-- chat deletion from the local history list or current chat toolbar
+## Local-First Quick Start (Per Client)
 
-## Project Location
-
-This project now lives entirely under:
-
-```text
-d:\APPS\Tools\localchat
-```
-
-The Python package is in:
-
-```text
-d:\APPS\Tools\localchat\localchat
-```
-
-## Included Models
-
-- `ollama:qwen2.5:7b`
-- `ollama:deepseek-r1`
-- `hf:Qwen/Qwen2.5-Coder-32B-Instruct`
-- `hf:deepseek-ai/DeepSeek-R1-Distill-Qwen-32B`
-- `gemini:gemini-2.5-flash`
-
-## Prerequisites
-
-### Required
-
-1. Python 3.12 or newer
-2. Internet access for Hugging Face or Gemini calls
-
-### Optional but recommended
-
-1. `uv` for dependency and run management
-2. Ollama if you want local models
-
-## End-to-End Setup
-
-### 1. Open the project folder
-
-From PowerShell:
-
+1. Install Python 3.12+ and Ollama.
+2. From repo root:
 ```powershell
-cd d:\APPS\Tools\localchat
-```
-
-### 2. Configure environment variables
-
-This project uses its own local env file:
-
-```text
-d:\APPS\Tools\localchat\.env
-```
-
-Template:
-
-```text
-d:\APPS\Tools\localchat\.env.example
-```
-
-Variables used by the app:
-
-- `HUGGINGFACE_API_KEY`
-- `GEMINI_API_KEY`
-- `OLLAMA_BASE_URL`
-- `HOST`
-- `PORT`
-- `COLLAB_ALLOW_REMOTE_CLIENTS`
-- `COLLAB_ALLOW_REMOTE_PAGES`
-- `COLLAB_ALLOWED_CLIENT_IPS`
-
-Notes:
-
-- `HUGGINGFACE_API_KEY` is required for Hugging Face models.
-- `GEMINI_API_KEY` is required for Gemini models.
-- `OLLAMA_BASE_URL` defaults to `http://127.0.0.1:11434`.
-- `HOST` and `PORT` control where the FastAPI app runs.
-- Collaboration pages are localhost-only by default.
-- To let remote collaborators join room or drafter sessions, set `COLLAB_ALLOW_REMOTE_CLIENTS=true` and put their client IPs in `COLLAB_ALLOWED_CLIENT_IPS`.
-- Keep `COLLAB_ALLOW_REMOTE_PAGES=false` if collaborators should run LocalChat from source on their own machine and connect to your shared server IP from there.
-
-### 3. Install dependencies
-
-#### Option A: use `uv`
-
-Install `uv` if it is not already installed:
-
-```powershell
+cd localchat
 python -m pip install uv
-```
-
-Install project dependencies:
-
-```powershell
 uv sync
 ```
-
-#### Option B: use standard `pip`
-
-Create and activate a virtual environment:
-
+3. Run local bootstrap (checks Ollama, pulls base Ollama models, checks CUDA/Torch, probes local TTS):
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+uv run localchat-bootstrap
 ```
-
-Install the project:
-
-```powershell
-python -m pip install -e .
-```
-
-## Ollama Setup For Local Models
-
-If you want to run Qwen and DeepSeek locally, install Ollama first.
-
-### 1. Install Ollama
-
-Download and install the Windows build from:
-
-```text
-https://ollama.com/download/windows
-```
- or in powershell run:
-```powershell
-
- irm https://ollama.com/install.ps1 | iex
- ```
-
- if in gitbash, after doing this install add this into your stuff:
- 
-# Make Ollama available in Git Bash if it is installed under the default Windows path.
-ask gpt to walk you through this step, or just use powershell...
-
-### 2. Pull the local models
-
-Using `uv`:
-
-```powershell
-uv run localchat-models
-```
-
-Without `uv`:
-
-```powershell
-python -m localchat.setup_models
-```
-
-This pulls:
-
-- `qwen2.5:7b`
-- `deepseek-r1`
-
-### 3. Confirm Ollama is running
-
-If Ollama is installed normally on Windows, the backend expects:
-
-```text
-http://127.0.0.1:11434
-```
-
-If your Ollama server runs somewhere else, update `OLLAMA_BASE_URL` in `.env`.
-
-## Run The App
-
-### Option A: run with `uv`
-
+4. Start app:
 ```powershell
 uv run localchat
 ```
-
-### Option B: run with `uvicorn`
-
-```powershell
-python -m uvicorn localchat.main:app --reload
-```
-
-Then open:
-
+5. Open:
 ```text
 http://127.0.0.1:8000
 ```
 
-If you changed `HOST` or `PORT`, use that address instead.
+## GPU + Local Voice Reader
+
+- Voice Reader uses `POST /api/tts/local` with local `qwen-tts` runtime.
+- Device selection is local per client:
+  - `LOCAL_TTS_DEVICE=auto` (default)
+  - `LOCAL_TTS_DEVICE=cuda:0`
+  - `LOCAL_TTS_DEVICE=cpu`
+- Quick CUDA check:
+```powershell
+uv run python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.device_count(), (torch.cuda.get_device_name(0) if torch.cuda.is_available() else ''))"
+```
+- Local TTS status endpoint:
+```text
+GET /api/tts/local/status
+```
+
+## Environment
+
+Copy `localchat/.env.example` to `localchat/.env` and adjust as needed.
+
+Most important values:
+- `OLLAMA_BASE_URL` (default `http://127.0.0.1:11434`)
+- `LOCAL_TTS_DEVICE` (`auto`, `cuda:0`, or `cpu`)
+- `HOST` / `PORT`
+- `COLLAB_ALLOW_REMOTE_CLIENTS`
+- `COLLAB_ALLOW_REMOTE_PAGES`
+- `COLLAB_ALLOWED_CLIENT_IPS`
 
 ## How To Use The UI
 
